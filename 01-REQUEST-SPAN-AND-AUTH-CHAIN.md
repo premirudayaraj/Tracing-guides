@@ -27,17 +27,17 @@ Common facts: one correlation header on the wire everywhere, but MDC key names d
 
 ```
  SERVER span  POST /billing/v3/accounts/search                 ← agent names it; code never renames it
- ├─ door:      {{PREFIX}}.correlation_id, user.name (masked), user.id, {{PREFIX}}.org_id, {{PREFIX}}.actor.*, {{PREFIX}}.channel_type, session.id
- ├─ authn:     {{PREFIX}}.authn.source=library|jwt|apikey|identity-headers   {{PREFIX}}.authn.result=ok|missing|expired|invalid|rejected_actor
- ├─ authz:     {{PREFIX}}.authz.provider=policy-engine|identity|policy-sidecar|permission-api|db|role  {{PREFIX}}.authz.policy=billing/get  {{PREFIX}}.authz.decision=allow|deny|error  {{PREFIX}}.authz.reason=NOT_ENOUGH_PERMISSIONS
+ ├─ door:      correlation_id, caller.service=portal-bff (+ caller.source), user.name (masked), user.id, org_id, actor.*, channel_type, session.id
+ ├─ authn:     authn.source=library|jwt|apikey|identity-headers   authn.result=ok|missing|expired|invalid|rejected_actor
+ ├─ authz:     authz.provider=policy-engine|identity|policy-sidecar|permission-api|db|role  authz.policy=billing/get  authz.decision=allow|deny|error  authz.reason=NOT_ENOUGH_PERMISSIONS
  │   └─ CLIENT span POST /v1/data/billing/get/allow  (agent)  peer.service=policy-engine
- ├─ grants:    {{PREFIX}}.user.context_source=cache|identity  {{PREFIX}}.user.accounts_count=7  {{PREFIX}}.user.assets_count=3  {{PREFIX}}.impersonation=none|user|org  {{PREFIX}}.support_org_mode=false
- ├─ decisions: feature_flag.key=…, feature_flag.result.variant=…, {{PREFIX}}.cache_hit, {{PREFIX}}.account.filter=permitted|org, {{PREFIX}}.fallback=…, {{PREFIX}}.result_count, {{PREFIX}}.no_record
+ ├─ grants:    grants.context_source=cache|identity  grants.accounts_count=7  grants.assets_count=3  impersonation=none|user|org  support_org_mode=false
+ ├─ decisions: feature_flag.key=…, feature_flag.result.variant=…, cache_hit, account.filter=permitted|org, fallback=…, result_count, no_record
  ├─ INTERNAL span AccountService.searchBillingAccounts  (@WithSpan, only for fan-out/async/hotspot)
  │   ├─ CLIENT POST  peer.service=account-platform   http.response.status_code=200     ← 04: request ids/flags + response ids + decision on outcome, on the caller's span / root
  │   ├─ CLIENT POST  peer.service=billing-hub        http.response.status_code=503  error.type=503
  │   └─ JDBC SELECT contacts.user_v
- └─ outcome:   http.response.status_code, error.type, {{PREFIX}}.error_code={{ERR_PREFIX}}-4210460, {{PREFIX}}.upstream.name=billing-hub, {{PREFIX}}.upstream.status=503   ← 03
+ └─ outcome:   http.response.status_code, error.type, error_code={{ERR_PREFIX}}-4210460, upstream.name=billing-hub, upstream.status=503   ← 03
 ```
 
 Five invariants:
@@ -53,7 +53,7 @@ Five invariants:
 
 Walk the request path in this order and produce the list of decision points **with file:line**. Only then place attributes.
 
-1. **Door.** Find the first filter that sees the request (servlet `Filter`/`OncePerRequestFilter` with the lowest order, WebFlux `WebFilter` with the lowest `@Order`, or the in-house library's request filter). Note: which headers become identity (`{{USER_HEADER}}`, `{{USER_KEY_HEADER}}`, `{{ORG_HEADER}}`, `{{ACTOR_USER_HEADER}}`, `{{ACTOR_ORG_HEADER}}`, `{{CHANNEL_HEADER}}`, `{{SESSION_HEADER}}`, the `{{SOURCE_APP_HEADER}}` header, `Authorization`, an auth-token header, `{{APIKEY_HEADER}}`, client-id / act-on-behalf headers), where the correlation id is read/generated, which MDC keys are set, what returns 401 before any application code.
+1. **Door.** Find the first filter that sees the request (servlet `Filter`/`OncePerRequestFilter` with the lowest order, WebFlux `WebFilter` with the lowest `@Order`, or the in-house library's request filter). Note **how the calling service can be identified** (§3.1 — verify, do not assume: a mesh client-certificate header, a gateway-injected app header, a self-declared `{{SOURCE_APP_HEADER}}`, an API key that maps to a named application, a service-account token's client claim — and which of these this service actually reads today, file:line). Note: which headers become identity (`{{USER_HEADER}}`, `{{USER_KEY_HEADER}}`, `{{ORG_HEADER}}`, `{{ACTOR_USER_HEADER}}`, `{{ACTOR_ORG_HEADER}}`, `{{CHANNEL_HEADER}}`, `{{SESSION_HEADER}}`, the `{{SOURCE_APP_HEADER}}` header, `Authorization`, an auth-token header, `{{APIKEY_HEADER}}`, client-id / act-on-behalf headers), where the correlation id is read/generated, which MDC keys are set, what returns 401 before any application code.
 2. **Authentication.** Where is the token/header *validated* (JWT decode, JWKS, expiry, API key compare, the library's context resolver)? What object holds the result (request context, JWT context, client context, user context)? Which failures exist (missing, expired, invalid signature, wrong audience, actor headers with a non-internal token, impersonator outside the corporate e-mail domain)?
 3. **Authorisation decision(s).** Every call that returns allow/deny: policy engine (`/v1/data/.../allow` → `result`), identity service (`isAuthorized` → `success`), policy sidecar (`/authorize` → `result.authorized`, `result.reason`), permission API (`/v1/permissions/{user}/assets`), `@RoleAllowed`/`hasRole`, DB ownership checks (account-ownership validator, requested accounts ⊆ permitted accounts, record-id validation). For each: the **inputs that matter** (policy key / action id / permission code / resource type / target resource name — never the token), the **output read**, whether it is **cached**, what a **deny** returns (status + error code), and what an **error** (provider unreachable, timeout) does — fail-open or fail-closed.
 4. **Grants / permitted data.** Lookups that decide *what the user may see*: permitted accounts (DB views, JPA by org, admin API), asset lists, roles (JWT roles, master-admin flag), org hierarchy, user-context cache (Redis). Register **counts and sources**, never the lists.
@@ -76,29 +76,72 @@ Span span = Span.current();                                            // the ag
 String cid = firstNonBlank(request.getHeader("{{CORRELATION_HEADER}}"), MDC.get("<existing key>"), UUID.randomUUID().toString()); // generate ONCE, here only
 MDC.put("<existing key>", cid);          // this service's existing MDC key — keep it (dashboards depend on it)
 MDC.put("correlationId", cid);           // ➕ common key across all services (LogQL: | json | correlationId="…")
-span.setAttribute("{{PREFIX}}.correlation_id", cid);
-span.setAttribute("{{PREFIX}}.correlation_id_generated", request.getHeader("{{CORRELATION_HEADER}}") == null);   // tells you which client sends none
+span.setAttribute("correlation_id", cid);
+span.setAttribute("correlation_id_generated", request.getHeader("{{CORRELATION_HEADER}}") == null);   // tells you which client sends none
 response.setHeader("{{CORRELATION_HEADER}}", cid);                      // ➕ echo on every response, success too
 
 // identity as received (masked where PII), before any validation:
 span.setAttribute("user.name", mask(header("{{USER_HEADER}}")));       // login, masked abc…xyz (first 3 + x… + last 3)
 span.setAttribute("user.id", header("{{USER_KEY_HEADER}}"));           // opaque key — only if the service has it
-span.setAttribute("{{PREFIX}}.org_id", header("{{ORG_HEADER}}"));      // customer org id
-span.setAttribute("{{PREFIX}}.channel_type", headerOr("{{CHANNEL_HEADER}}", "-"));   // internal portal, customer portal, …
-span.setAttribute("{{PREFIX}}.source_app", headerOr("{{SOURCE_APP_HEADER}}", "-"));
-span.setAttribute("{{PREFIX}}.actor.present", hasActorHeaders);        // {{ACTOR_USER_HEADER}} / {{ACTOR_ORG_HEADER}} present
-if (hasActorHeaders) { span.setAttribute("{{PREFIX}}.actor.user_name", mask(header("{{ACTOR_USER_HEADER}}"))); span.setAttribute("{{PREFIX}}.actor.org_id", header("{{ACTOR_ORG_HEADER}}")); }
+span.setAttribute("org_id", header("{{ORG_HEADER}}"));      // customer org id
+span.setAttribute("channel_type", headerOr("{{CHANNEL_HEADER}}", "-"));   // internal portal, customer portal, …
+Caller c = CallerIdentity.resolve(request);                            // §3.1: WHO CALLED — the calling service's name, from the strongest source available
+span.setAttribute("caller.service", c.name());               // "billing-api" | "portal-bff" | "external" | "unknown" — the name itself, never the transport it arrived through
+span.setAttribute("caller.source", c.source());              // mesh-cert | gateway-header | api-key | jwt-client | source-app-header | none — how the name was obtained (§3.1 order)
+if (c.declaredDiffers()) span.setAttribute("caller.declared", c.declared());   // the self-declared {{SOURCE_APP_HEADER}} value when a stronger source disagrees with it
+span.setAttribute("actor.present", hasActorHeaders);        // {{ACTOR_USER_HEADER}} / {{ACTOR_ORG_HEADER}} present
+if (hasActorHeaders) { span.setAttribute("actor.user_name", mask(header("{{ACTOR_USER_HEADER}}"))); span.setAttribute("actor.org_id", header("{{ACTOR_ORG_HEADER}}")); }
 span.setAttribute("session.id", header("{{SESSION_HEADER}}"));          // if present
-span.setAttribute("{{PREFIX}}.authn.result", "not_evaluated");          // default; the validation step (§4.1) overwrites — an exception before it leaves this value, not "ok"
+span.setAttribute("authn.result", "not_evaluated");          // default; the validation step (§4.1) overwrites — an exception before it leaves this value, not "ok"
 try (Scope root = RequestSpan.open(span)) { chain.doFilter(request, response); }   // §6: makes the SERVER span reachable from every child scope; scope closed in the try-with-resources
 finally { MDC.clear(); }
 ```
 WebFlux: the same filter writes the span into the Reactor context instead of a thread scope — `chain.filter(exchange).contextWrite(ctx -> ctx.put(RequestSpan.KEY, span))` and `RequestSpan.root()` reads it through the agent's Reactor context propagation (⚠ verify once). Kotlin coroutines: launch with `MDCContext()` so MDC follows the coroutine; the agent propagates the OTel context.
 
 * MUST read-or-generate the correlation id once, at the door; MUST keep existing MDC keys and ➕ add the common `correlationId`.
+* MUST register the **calling service's name** (`caller.service`) on the door span of every service, resolved per §3.1; `external`/`unknown` when nothing identifies it — never an invented name.
 * MUST NOT put `Authorization`, auth-token headers, `{{APIKEY_HEADER}}`, client-auth headers or any token on the span.
-* The agent's header capture stays as it is — attribute key `http.request.header.<header-in-lower-case>` (agents older than 2.x wrote underscores instead of hyphens ⚠ check one span; quote the key in TraceQL: `span."http.request.header.x-correlation-id"`); `{{PREFIX}}.correlation_id` is the one key that works on **every** span kind (Kafka, jobs, browser), which is why it is set explicitly.
+* The agent's header capture stays as it is — attribute key `http.request.header.<header-in-lower-case>` (agents older than 2.x wrote underscores instead of hyphens ⚠ check one span; quote the key in TraceQL: `span."http.request.header.x-correlation-id"`); `correlation_id` is the one key that works on **every** span kind (Kafka, jobs, browser), which is why it is set explicitly.
 * Health/readiness routes are never instrumented: the collector drops `http.route =~ ^/.*actuator/health/.*`; ➕ extend the filter to cover services whose probes live under a management path (`^/(.*actuator|management)/health.*`).
+
+### 3.1 Who called — the calling service's name on the inbound span
+
+`peer.service` on a CLIENT span names the service being called; nothing standard names the service that **called** on the SERVER span, and without it the callee cannot answer "who is sending me these requests" when the trace is broken (agent off upstream, a non-instrumented caller, a gateway in between). So every door span carries **one canonical attribute**, `caller.service`, whose value is the caller's **name** — the same string that is the caller's `service.name` and the callee's `peer.service` entry in the mapping table (04 §3): one naming table per estate, used on both sides.
+
+The thing recorded is the *name*; the transport is only the **mechanism** for obtaining it. Resolve in this order and stop at the first that yields a name (`caller.source` says which one did):
+
+| Order | Source (`caller.source`) | Where the name comes from | Trust |
+|---|---|---|---|
+| 1 | `mesh-cert` | the sidecar's client-certificate header (Envoy/Istio `X-Forwarded-Client-Cert`: the `URI=spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>` element → service-account → service name via the naming table) | strong **only** when the mesh sets/overwrites the header (`forwardClientCertDetails: SANITIZE_SET`) — otherwise a client can forge it; ⚠ confirm the mesh setting once per cluster |
+| 2 | `gateway-header` | a header the API gateway injects after verifying the credential (`{{GATEWAY_CALLER_HEADER}}`: the developer app / client name) | strong when the gateway strips the same header from inbound traffic; ⚠ confirm |
+| 3 | `api-key` | the service authenticates callers with `{{APIKEY_HEADER}}` and has (or ➕ gets) a **registry** `key → application name`; register the **name**, never the key | strong |
+| 4 | `jwt-client` | a service-account token's client claim (`azp`, `client_id`, `appid`, or `sub` for service accounts) mapped through the registry | strong |
+| 5 | `source-app-header` | the calling service **declares itself** in `{{SOURCE_APP_HEADER}}` (04 §5 makes every outbound client send its own `service.name` there) | self-declared — enough for internal traffic, not for authorisation |
+| 6 | `none` | nothing identifies a service: `external` if the request came through the public gateway / a browser channel (`{{CHANNEL_HEADER}}` or gateway header present), else `unknown` | — |
+
+```java
+// tracing/CallerIdentity.java ➕ — one resolver per service; the door filter calls it once. Registry = a small map in config: apikeys.<name>=<key>, jwt-clients.<client_id>=<name>, service-accounts.<sa>=<name>
+public static Caller resolve(HttpServletRequest r) {
+  String declared = r.getHeader("{{SOURCE_APP_HEADER}}");
+  String fromMesh = MeshCert.serviceName(r.getHeader("X-Forwarded-Client-Cert"));   // parses the URI=spiffe://…/sa/<sa> element → registry; null when absent or the mesh does not sanitise it
+  if (fromMesh != null)                          return Caller.of(fromMesh, "mesh-cert", declared);
+  String fromGw = r.getHeader("{{GATEWAY_CALLER_HEADER}}");
+  if (notBlank(fromGw))                          return Caller.of(fromGw, "gateway-header", declared);
+  String fromKey = registry.appOf(r.getHeader("{{APIKEY_HEADER}}"));                // name only — the key value never leaves this method
+  if (fromKey != null)                           return Caller.of(fromKey, "api-key", declared);
+  String fromJwt = registry.appOfClient(JwtPeek.clientClaim(r));                    // azp / client_id / appid; only for service-account tokens
+  if (fromJwt != null)                           return Caller.of(fromJwt, "jwt-client", declared);
+  if (notBlank(declared))                        return Caller.of(declared, "source-app-header", null);
+  boolean viaGateway = r.getHeader("{{CHANNEL_HEADER}}") != null || r.getHeader("{{GATEWAY_CALLER_HEADER}}") != null;
+  return Caller.of(viaGateway ? "external" : "unknown", "none", null);
+}
+```
+Rules:
+* **Internal call** → the actual caller service name. **External call** (customer, partner, browser) → `external`; nothing known → `unknown`. Never invent, never fall back to a hostname or an IP (`client.address` is the agent's and stays what it is).
+* **One naming table, one name per service everywhere**: a service's `service.name` (resource attribute), the value its callers register as `caller.service`, and its entry in every `peer.service` mapping are the same string. The registry (`apikeys.<name>`, `jwt-clients`, `service-accounts`) and the mesh/gateway mapping resolve **to** that name.
+* Values are low-cardinality (one per service in the estate); `{ kind = server } | by(span.caller.service)` is the "who calls me" panel, `{ span.caller.source = "source-app-header" }` shows which callers are only self-declared, `{ span.caller.declared != nil }` shows misconfigured clients (declared ≠ verified).
+* Node BFFs and servers apply the same resolver in the door middleware (07 N2); consumers do not need it (the producer is the caller — `messaging.*` + `event_source`, 05 K2).
+* The analysis (§2 step 1) must say, per service, which of the six sources exist **today** (file:line) and which registry is missing; a service that reads none of them registers `caller.service=unknown` for all traffic until 04 §5 is applied on its callers — that value is the finding, not a bug.
 
 ---
 
@@ -110,13 +153,13 @@ The chain is a sequence of decisions; each is registered **where it is made**, o
 
 ```java
 // where the token/header is validated (the JWT aspect, the library's context resolver, after the library filter)
-span.setAttribute("{{PREFIX}}.authn.source", "jwt");             // library | jwt | apikey | identity-headers | service-account | none
-span.setAttribute("{{PREFIX}}.authn.result", "ok");              // written where validation CONCLUDES (door default is not_evaluated); on failure one of:
+span.setAttribute("authn.source", "jwt");             // library | jwt | apikey | identity-headers | service-account | none
+span.setAttribute("authn.result", "ok");              // written where validation CONCLUDES (door default is not_evaluated); on failure one of:
 //   missing | expired | invalid | rejected_actor (user/service-account token with actor headers) | not_internal (impersonator outside the corporate domain) | forwarded (this layer only forwards the token — Node BFFs)
-span.setAttribute("{{PREFIX}}.authn.token_type", jwt.isServiceAccount() ? "service-account" : "user");   // never the token
+span.setAttribute("authn.token_type", jwt.isServiceAccount() ? "service-account" : "user");   // never the token
 span.setAttribute(AttributeKey.stringArrayKey("user.roles"), jwtContext.getRoles());   // string[] of role names, low cardinality (RequestSpan.set has no array overload — use the key)
 ```
-* A 401 produced *inside* the service is a traced span with `{{PREFIX}}.authn.result != ok` + `{{PREFIX}}.error_code` (03). When the 401/403 is produced by Spring Security (no `@ControllerAdvice` runs), register it in the `AuthenticationEntryPoint` / `AccessDeniedHandler` (or the WebFlux `ServerAuthenticationEntryPoint`) with the same `SpanOutcome.record` call (03 §2); when it is produced by an in-house library filter, the only place is the library itself — until it is changed, the door filter in §3 guarantees at least the correlation id and the raw identity are on that span. 401s produced by the API gateway / edge proxy never reach the service and are not spans.
+* A 401 produced *inside* the service is a traced span with `authn.result != ok` + `error_code` (03). When the 401/403 is produced by Spring Security (no `@ControllerAdvice` runs), register it in the `AuthenticationEntryPoint` / `AccessDeniedHandler` (or the WebFlux `ServerAuthenticationEntryPoint`) with the same `SpanOutcome.record` call (03 §2); when it is produced by an in-house library filter, the only place is the library itself — until it is changed, the door filter in §3 guarantees at least the correlation id and the raw identity are on that span. 401s produced by the API gateway / edge proxy never reach the service and are not spans.
 
 ### 4.2 Authorisation decisions (may the caller do this)
 
@@ -124,39 +167,39 @@ One attribute set per decision engine, registered in the handler that reads the 
 
 ```java
 // policy engine (OPA-style) — policy enforcer / result handler (reference A), policy client (reference D)
-span.setAttribute("{{PREFIX}}.authz.provider", "policy-engine");
-span.setAttribute("{{PREFIX}}.authz.policy", policy.key());                       // "billing/get" — the policy package path, not the URL
-span.setAttribute("{{PREFIX}}.authz.decision", allowed ? "allow" : "deny");       // "error" when the engine is unreachable / input empty
-span.setAttribute("{{PREFIX}}.authz.reason", allowed ? "-" : "NOT_ENOUGH_PERMISSIONS");   // catalogue key of the code the deny maps to
-span.setAttribute("{{PREFIX}}.authz.input.actor", input.actorUser != null);      // booleans/counts about the input, never the input
-span.setAttribute("{{PREFIX}}.authz.input.permissions_count", input.permissions.size());
+span.setAttribute("authz.provider", "policy-engine");
+span.setAttribute("authz.policy", policy.key());                       // "billing/get" — the policy package path, not the URL
+span.setAttribute("authz.decision", allowed ? "allow" : "deny");       // "error" when the engine is unreachable / input empty
+span.setAttribute("authz.reason", allowed ? "-" : "NOT_ENOUGH_PERMISSIONS");   // catalogue key of the code the deny maps to
+span.setAttribute("authz.input.actor", input.actorUser != null);      // booleans/counts about the input, never the input
+span.setAttribute("authz.input.permissions_count", input.permissions.size());
 
 // identity service permission check — permission aspect → identity client isAuthorized (reference C)
-span.setAttribute("{{PREFIX}}.authz.provider", "identity");
-span.setAttribute("{{PREFIX}}.authz.policy", permissionCheck.action() + ":" + permissionCheck.resourceType());   // "VIEW:BILLING_ACCOUNT"
-span.setAttribute("{{PREFIX}}.authz.decision", response.isSuccess() ? "allow" : "deny");
+span.setAttribute("authz.provider", "identity");
+span.setAttribute("authz.policy", permissionCheck.action() + ":" + permissionCheck.resourceType());   // "VIEW:BILLING_ACCOUNT"
+span.setAttribute("authz.decision", response.isSuccess() ? "allow" : "deny");
 
 // policy sidecar — sidecar aspect → sidecar client authorize (reference C)
-span.setAttribute("{{PREFIX}}.authz.provider", "policy-sidecar");
-span.setAttribute("{{PREFIX}}.authz.policy", actionId);                           // "action:use/getBillingAccount"
-span.setAttribute("{{PREFIX}}.authz.decision", authorized ? "allow" : (failed ? "error" : "deny"));   // fail-closed: error is also a deny
-span.setAttribute("{{PREFIX}}.authz.reason", result.getReason());                // only if low-cardinality; otherwise a code
-span.setAttribute("{{PREFIX}}.authz.accounts_checked", perAccount.size());
+span.setAttribute("authz.provider", "policy-sidecar");
+span.setAttribute("authz.policy", actionId);                           // "action:use/getBillingAccount"
+span.setAttribute("authz.decision", authorized ? "allow" : (failed ? "error" : "deny"));   // fail-closed: error is also a deny
+span.setAttribute("authz.reason", result.getReason());                // only if low-cardinality; otherwise a code
+span.setAttribute("authz.accounts_checked", perAccount.size());
 
 // permission API role check — authorizer of the identity system (reference B)
-span.setAttribute("{{PREFIX}}.authz.provider", "permission-api");  span.setAttribute("{{PREFIX}}.authz.policy", "MASTER_ADMIN");  span.setAttribute("{{PREFIX}}.authz.decision", isMasterAdmin ? "allow" : "deny");
-span.setAttribute("{{PREFIX}}.authz.reseller_shortcut", resellerShortcutApplied);  // an override that bypasses the check for a category of accounts
+span.setAttribute("authz.provider", "permission-api");  span.setAttribute("authz.policy", "MASTER_ADMIN");  span.setAttribute("authz.decision", isMasterAdmin ? "allow" : "deny");
+span.setAttribute("authz.reseller_shortcut", resellerShortcutApplied);  // an override that bypasses the check for a category of accounts
 
 // DB ownership / in-memory checks — account-ownership validator, requested ⊆ permitted, record-id validation
-span.setAttribute("{{PREFIX}}.authz.provider", "db");  span.setAttribute("{{PREFIX}}.authz.policy", "account_ownership");  span.setAttribute("{{PREFIX}}.authz.decision", owns ? "allow" : "deny");  span.setAttribute("{{PREFIX}}.authz.reason", owns ? "-" : "ACCOUNT_NOT_BELONGS_TO_USER");
+span.setAttribute("authz.provider", "db");  span.setAttribute("authz.policy", "account_ownership");  span.setAttribute("authz.decision", owns ? "allow" : "deny");  span.setAttribute("authz.reason", owns ? "-" : "ACCOUNT_NOT_BELONGS_TO_USER");
 
 // role gate — role aspect / @RoleAllowed / hasRole
-span.setAttribute("{{PREFIX}}.authz.provider", "role");  span.setAttribute("{{PREFIX}}.authz.policy", String.join(",", roleAllowed.value()));  span.setAttribute("{{PREFIX}}.authz.decision", ok ? "allow" : "deny");
+span.setAttribute("authz.provider", "role");  span.setAttribute("authz.policy", String.join(",", roleAllowed.value()));  span.setAttribute("authz.decision", ok ? "allow" : "deny");
 ```
 
-* **Key rule when engines can vary per request** (reference C: the identity check only when the hierarchy flag is on, the sidecar only when enabled, then ownership): every engine writes its own set `{{PREFIX}}.authz.<provider>.decision|policy|reason` (`{{PREFIX}}.authz.policy-engine.decision`, `{{PREFIX}}.authz.identity.decision`, `{{PREFIX}}.authz.policy-sidecar.decision`, `{{PREFIX}}.authz.db.decision`, `{{PREFIX}}.authz.role.decision`); the **plain** keys `{{PREFIX}}.authz.decision` / `{{PREFIX}}.authz.reason` are the **overall** outcome (`deny` if any engine denied, `error` if any failed closed, else `allow`) and `{{PREFIX}}.authz.decided_by` names the engine that produced a deny/error. A service with exactly one engine may write only the plain keys plus `{{PREFIX}}.authz.provider`. The snippets above show the plain form for brevity; apply this rule literally.
-* `{{PREFIX}}.authz.reason` is the **catalogue key** of the code the deny maps to (`NOT_ENOUGH_PERMISSIONS`, `ACCOUNT_NOT_BELONGS_TO_USER`, `UNAUTHORIZED_RESOURCE_ACCESS`, `ACT_ON_BEHALF_DENIED`) — never a free-text reason; `{{PREFIX}}.error_code` (03) carries exactly what the response body carries (if a service today derives the code from the HTTP status instead of the catalogue, register it as is — the mismatch is what the attribute reveals; 02 §7.1).
-* Every deny/error is also an outcome (03): `{{PREFIX}}.error_code`, `error.type` = the exception class or the code; status `ERROR` only for 5xx-class failures (provider unreachable), **not** for a 403 — a deny is a correct answer.
+* **Key rule when engines can vary per request** (reference C: the identity check only when the hierarchy flag is on, the sidecar only when enabled, then ownership): every engine writes its own set `authz.<provider>.decision|policy|reason` (`authz.policy-engine.decision`, `authz.identity.decision`, `authz.policy-sidecar.decision`, `authz.db.decision`, `authz.role.decision`); the **plain** keys `authz.decision` / `authz.reason` are the **overall** outcome (`deny` if any engine denied, `error` if any failed closed, else `allow`) and `authz.decided_by` names the engine that produced a deny/error. A service with exactly one engine may write only the plain keys plus `authz.provider`. The snippets above show the plain form for brevity; apply this rule literally.
+* `authz.reason` is the **catalogue key** of the code the deny maps to (`NOT_ENOUGH_PERMISSIONS`, `ACCOUNT_NOT_BELONGS_TO_USER`, `UNAUTHORIZED_RESOURCE_ACCESS`, `ACT_ON_BEHALF_DENIED`) — never a free-text reason; `error_code` (03) carries exactly what the response body carries (if a service today derives the code from the HTTP status instead of the catalogue, register it as is — the mismatch is what the attribute reveals; 02 §7.1).
+* Every deny/error is also an outcome (03): `error_code`, `error.type` = the exception class or the code; status `ERROR` only for 5xx-class failures (provider unreachable), **not** for a 403 — a deny is a correct answer.
 * The authorisation call itself is a CLIENT span (agent) under the SERVER span with `peer.service=policy-engine|identity|policy-sidecar|permission-api` (04 §3) — its duration is the answer to "is the policy engine slow"; the decision is on the parent.
 * Never register the policy input document, the token, resource names that embed user data, or the `permissions[]` list. Counts and booleans only.
 
@@ -165,37 +208,37 @@ span.setAttribute("{{PREFIX}}.authz.provider", "role");  span.setAttribute("{{PR
 The four reference chains are examples; **run §2 on every project**. Where a project uses plain Spring Security instead of an in-house library/aspects — detectors: `SecurityFilterChain`, `oauth2ResourceServer()`, `JwtDecoder`/`ReactiveJwtDecoder`, `@EnableMethodSecurity`, `@PreAuthorize`/`@PostAuthorize`/`@PostFilter`, `@Secured`, `@RolesAllowed`, `hasRole`/`hasAuthority`, `AuthorizationManager`/`ReactiveAuthorizationManager`, gRPC `ServerInterceptor` — register with the framework's own hooks, once per service:
 ```java
 @Component class AuthTracing {
-  @EventListener void ok(AuthenticationSuccessEvent e)            { Span s = RequestSpan.root(); s.setAttribute("{{PREFIX}}.authn.source", "jwt"); s.setAttribute("{{PREFIX}}.authn.result", "ok"); s.setAttribute(AttributeKey.stringArrayKey("user.roles"), roles(e.getAuthentication())); }
-  @EventListener void ko(AbstractAuthenticationFailureEvent e)    { Span s = RequestSpan.root(); s.setAttribute("{{PREFIX}}.authn.result", kind(e.getException())); }   // missing|expired|invalid
-  @EventListener void denied(AuthorizationDeniedEvent<?> e)       { Span s = RequestSpan.root(); s.setAttribute("{{PREFIX}}.authz.provider", "spring-security"); s.setAttribute("{{PREFIX}}.authz.policy", String.valueOf(e.getAuthorizationResult())); s.setAttribute("{{PREFIX}}.authz.decision", "deny"); }
+  @EventListener void ok(AuthenticationSuccessEvent e)            { Span s = RequestSpan.root(); s.setAttribute("authn.source", "jwt"); s.setAttribute("authn.result", "ok"); s.setAttribute(AttributeKey.stringArrayKey("user.roles"), roles(e.getAuthentication())); }
+  @EventListener void ko(AbstractAuthenticationFailureEvent e)    { Span s = RequestSpan.root(); s.setAttribute("authn.result", kind(e.getException())); }   // missing|expired|invalid
+  @EventListener void denied(AuthorizationDeniedEvent<?> e)       { Span s = RequestSpan.root(); s.setAttribute("authz.provider", "spring-security"); s.setAttribute("authz.policy", String.valueOf(e.getAuthorizationResult())); s.setAttribute("authz.decision", "deny"); }
   @Bean AuthorizationEventPublisher publisher(ApplicationEventPublisher p) { return new SpringAuthorizationEventPublisher(p); }   // required for AuthorizationDeniedEvent
 }
 // AuthenticationEntryPoint / AccessDeniedHandler (MVC) or ServerAuthenticationEntryPoint / ServerAccessDeniedHandler (WebFlux): SpanOutcome.record("{{ERR_PREFIX}}-<module>005", "NOT_ENOUGH_PERMISSIONS", 401|403, null) — the ControllerAdvice never sees these
 ```
-Method-security expressions (`@PreAuthorize("hasRole('ADMIN')")`) register `{{PREFIX}}.authz.policy` = the expression text (low cardinality, it is source code) through the `AuthorizationDeniedEvent`; a successful check registers nothing extra beyond `user.roles`.
+Method-security expressions (`@PreAuthorize("hasRole('ADMIN')")`) register `authz.policy` = the expression text (low cardinality, it is source code) through the `AuthorizationDeniedEvent`; a successful check registers nothing extra beyond `user.roles`.
 
 ### 4.3 Grants — what the user was given for this request
 
 ```java
 // user-context interceptor/service (reference C), contact + permitted-accounts services (references A, B)
-span.setAttribute("{{PREFIX}}.user.context_source", fromCache ? "cache" : "identity");   // cache hit or identity-service profile call
-span.setAttribute("{{PREFIX}}.user.accounts_source", "permissions_view");                // permissions_view | org_accounts(admin API) | accounts_by_org(JPA) | hierarchy
-span.setAttribute("{{PREFIX}}.user.accounts_count", permitted.size());                   // 0 is the interesting value
-span.setAttribute("{{PREFIX}}.user.assets_count", assets.size());
-span.setAttribute("{{PREFIX}}.user.hierarchy_enabled", userContext.isHierarchyEnabled());
-span.setAttribute("{{PREFIX}}.user.is_internal", contact.isInternalUser());
-span.setAttribute("{{PREFIX}}.user.accounts_fallback", true);                             // when "lookup failed → defaulting to no permitted accounts"
+span.setAttribute("grants.context_source", fromCache ? "cache" : "identity");   // cache hit or identity-service profile call
+span.setAttribute("grants.accounts_source", "permissions_view");                // permissions_view | org_accounts(admin API) | accounts_by_org(JPA) | hierarchy
+span.setAttribute("grants.accounts_count", permitted.size());                   // 0 is the interesting value
+span.setAttribute("grants.assets_count", assets.size());
+span.setAttribute("grants.hierarchy_enabled", userContext.isHierarchyEnabled());
+span.setAttribute("grants.internal_user", contact.isInternalUser());
+span.setAttribute("grants.accounts_fallback", true);                             // when "lookup failed → defaulting to no permitted accounts"
 ```
 
 ### 4.4 Impersonation, support-org mode, channel
 
 ```java
 // actor context (reference C), isSupportOrgMode (reference A), channel == internal portal (reference B), internal-org guard
-span.setAttribute("{{PREFIX}}.impersonation", "none");     // default at the door; overwrite: user ({{ACTOR_USER_HEADER}}) | org ({{ACTOR_ORG_HEADER}} only)
-span.setAttribute("{{PREFIX}}.support_org_mode", supportOrgMode);
-span.setAttribute("{{PREFIX}}.internal_guard", "ok");      // ok | missing_actor (401 for the internal org without actor headers)
-span.setAttribute("{{PREFIX}}.effective.org_id", effectiveOrgId);                          // the org the query actually used (may differ from {{PREFIX}}.org_id)
-span.setAttribute("{{PREFIX}}.effective.user_name", mask(effectiveUser));                  // actor when impersonating
+span.setAttribute("impersonation", "none");     // default at the door; overwrite: user ({{ACTOR_USER_HEADER}}) | org ({{ACTOR_ORG_HEADER}} only)
+span.setAttribute("support_org_mode", supportOrgMode);
+span.setAttribute("internal_guard", "ok");      // ok | missing_actor (401 for the internal org without actor headers)
+span.setAttribute("effective.org_id", effectiveOrgId);                          // the org the query actually used (may differ from org_id)
+span.setAttribute("effective.user_name", mask(effectiveUser));                  // actor when impersonating
 ```
 
 ### 4.5 Read-only mode and other request-level gates
@@ -205,8 +248,8 @@ span.setAttribute("{{PREFIX}}.effective.user_name", mask(effectiveUser));       
 span.setAttribute("feature_flag.key", "applicationReadOnlyMode");
 span.setAttribute("feature_flag.result.variant", readOnly ? "on" : "off");
 span.setAttribute("feature_flag.provider.name", "<your flag provider>");
-span.setAttribute("{{PREFIX}}.gate.readonly", readOnly && isWrite ? "blocked" : "pass");
-span.setAttribute("{{PREFIX}}.env", envHeader);
+span.setAttribute("gate.readonly", readOnly && isWrite ? "blocked" : "pass");
+span.setAttribute("env", envHeader);
 ```
 
 ---
@@ -220,22 +263,22 @@ The controller adds the **request's business identifiers** before calling the se
 @Policy(key = "billing/get")
 public ResponseEntity<BillingAccountSearchResponse> search(@RequestBody BillingAccountSearchRequest req, RequestContext ctx) {
   Span span = Span.current();
-  span.setAttribute("{{PREFIX}}.customer_account", req.getCustomerAccountNumber());     // as soon as known, before any call
-  span.setAttribute("{{PREFIX}}.page_size", req.getLimit());  span.setAttribute("{{PREFIX}}.page_offset", req.getOffset());
-  span.setAttribute("{{PREFIX}}.search_scope", req.getSearchScope());      // enum
+  span.setAttribute("customer_account", req.getCustomerAccountNumber());     // as soon as known, before any call
+  span.setAttribute("page_size", req.getLimit());  span.setAttribute("page_offset", req.getOffset());
+  span.setAttribute("search_scope", req.getSearchScope());      // enum
   return ResponseEntity.ok(service.searchBillingAccounts(ctx, req).join());
 }
 
 @WithSpan("AccountService.searchBillingAccounts")      // only because it fans out to two upstreams + DB
 public CompletableFuture<BillingAccountSearchResponse> searchBillingAccounts(RequestContext ctx, BillingAccountSearchRequest req) {
-  RequestSpan.set("{{PREFIX}}.account.filter", "permitted");             // changes the response → ROOT span (default; overwritten below)
-  if (commonService.isSupportOrgMode(ctx)) RequestSpan.set("{{PREFIX}}.account.filter", "org");
-  RequestSpan.here("{{PREFIX}}.cache_hit", "false");                      // local to this unit of work → the @WithSpan span (default before the lookup)
+  RequestSpan.set("account.filter", "permitted");             // changes the response → ROOT span (default; overwritten below)
+  if (commonService.isSupportOrgMode(ctx)) RequestSpan.set("account.filter", "org");
+  RequestSpan.here("cache_hit", "false");                      // local to this unit of work → the @WithSpan span (default before the lookup)
   ...
-  RequestSpan.set("{{PREFIX}}.billing-hub.version", "v3");                // which upstream contract was chosen → root
-  RequestSpan.here("{{PREFIX}}.billing-hub.batches", String.valueOf(batches.size()));   // fan-out shape → this span
-  RequestSpan.set("{{PREFIX}}.result_count", result.size());              // root
-  RequestSpan.set("{{PREFIX}}.no_record", result.isEmpty());              // root — "empty 200" advices make this invisible otherwise
+  RequestSpan.set("billing-hub.version", "v3");                // which upstream contract was chosen → root
+  RequestSpan.here("billing-hub.batches", String.valueOf(batches.size()));   // fan-out shape → this span
+  RequestSpan.set("result_count", result.size());              // root
+  RequestSpan.set("no_record", result.isEmpty());              // root — "empty 200" advices make this invisible otherwise
   return ...;
 }
 ```
@@ -245,20 +288,21 @@ Decision catalogue — register these whenever they exist (names in §7):
 
 | Decision type | Attribute(s) | Typical places |
 |---|---|---|
-| Feature flag evaluated | `{{PREFIX}}.flag.<key>=<variant>` for **every** flag evaluated on the request (one key per flag — a read-only-mode flag is often evaluated on every request, so most requests see more than one flag); additionally the standard `feature_flag.key` / `feature_flag.result.variant` / `feature_flag.provider.name` for the single flag that decided the code path of *this* span, if there is one | flag-provider gates (read-only mode, listener enable flags, migration toggles); `@ConditionalOnProperty` toggles are startup facts — one INFO line at startup, nothing per request |
-| Cache hit / miss | `{{PREFIX}}.cache_hit` (+ `{{PREFIX}}.cache.name`) | Redis user-context cache, OAuth token cache, in-memory principal cache, a Node help-topics cache fallback |
-| Fallback taken | `{{PREFIX}}.fallback=<what>` (`no_permitted_accounts`, `empty_contact`, `default_project_null`, `help_topics_cache`) | "lookup failed → proceed without filter" paths, a timeout → empty object, a hierarchy lookup → null |
-| Filter / skip | `{{PREFIX}}.skipped=true`, `{{PREFIX}}.skip_reason=<enum>` | listener filters (05), no-record → empty 200 advices |
-| Version / route chosen | `{{PREFIX}}.<dep>.version` (`v1\|v2\|v3`), `{{PREFIX}}.strategy` | upstream v1/v2/v3 contracts, search-by-company vs search-by-account |
-| Fan-out shape | `{{PREFIX}}.<dep>.batches`, `{{PREFIX}}.batch_size`, `{{PREFIX}}.parallelism` | enrichment in batches of N, `CompletableFuture` joins |
-| Result | `{{PREFIX}}.result_count`, `{{PREFIX}}.no_record`, `{{PREFIX}}.truncated` (hard caps) | every service method returning a list/page |
-| Validation | `{{PREFIX}}.validation.failed=true`, `{{PREFIX}}.validation.field_count` | custom validators, `MethodArgumentNotValidException` handler |
-| Retry | `{{PREFIX}}.retry.attempts`, `{{PREFIX}}.retry.exhausted` | `@Retryable`/`@Recover`, policy-engine retry ×3 |
-| Timeout policy | `{{PREFIX}}.timeout_ms` when it is a per-call decision | `CompletableFuture.get(20, SECONDS)`, a long read timeout for an LLM proxy |
+| Feature flag evaluated | `flag.<key>=<variant>` for **every** flag evaluated on the request (one key per flag — a read-only-mode flag is often evaluated on every request, so most requests see more than one flag); additionally the standard `feature_flag.key` / `feature_flag.result.variant` / `feature_flag.provider.name` for the single flag that decided the code path of *this* span, if there is one | flag-provider gates (read-only mode, listener enable flags, migration toggles); `@ConditionalOnProperty` toggles are startup facts — one INFO line at startup, nothing per request |
+| Cache hit / miss | `cache_hit` (+ `cache.name`) | Redis user-context cache, OAuth token cache, in-memory principal cache, a Node help-topics cache fallback |
+| Fallback taken | `fallback=<what>` (`no_permitted_accounts`, `empty_contact`, `default_project_null`, `help_topics_cache`) | "lookup failed → proceed without filter" paths, a timeout → empty object, a hierarchy lookup → null |
+| Filter / skip | `skipped=true`, `skip_reason=<enum>` | listener filters (05), no-record → empty 200 advices |
+| Version / route chosen | `<dep>.version` (`v1\|v2\|v3`), `strategy` | upstream v1/v2/v3 contracts, search-by-company vs search-by-account |
+| Fan-out shape | `<dep>.batches`, `batch_size`, `parallelism` | enrichment in batches of N, `CompletableFuture` joins |
+| Result | `result_count`, `no_record`, `truncated` (hard caps) | every service method returning a list/page |
+| Validation | `validation.failed=true`, `validation.field_count` | custom validators, `MethodArgumentNotValidException` handler |
+| Retry | its own per-purpose span `<dependency> <purpose> retry` with `retry.count`, `retry.max`, `retry.outcome` (04 §4.4) — a count, never a span or event per attempt, never an error code | `@Retryable`/`@Recover`, policy-engine retry ×3 |
+| Non-fatal error | `<dependency>.<action>.failure` = short reason, one key per failed call (`SpanOutcome.nonFatal`), + `failure_count` + the `<dep>.outcome` facet — **no** `error_code` (03 §2.1) | catch-all around a notification, `onErrorReturn`, `.exceptionally` |
+| Timeout policy | `timeout_ms` when it is a per-call decision | `CompletableFuture.get(20, SECONDS)`, a long read timeout for an LLM proxy |
 
 Rules:
 * **Defaults first.** Write the default value at the top of the method, overwrite on the branch. Every span then has the key and TraceQL `= false` works.
-* **Counts, not lists; enums, not text.** `{{PREFIX}}.user.accounts_count=0` not the list; `{{PREFIX}}.skip_reason=EMPTY_ACCOUNT_NUMBER` not the log sentence.
+* **Counts, not lists; enums, not text.** `grants.accounts_count=0` not the list; `skip_reason=EMPTY_ACCOUNT_NUMBER` not the log sentence.
 * **Never in a loop.** For a fan-out over N items register `N`, the number failed, and (only if there is exactly one that matters) its id.
 * **`@WithSpan` only** on a public use-case method that fans out to ≥2 downstreams, runs async, or is a known hotspot; name = `Class.method`; never on getters, mappers, validators, DAOs (the agent's JDBC spans already exist).
 
@@ -271,9 +315,9 @@ A decision made inside a `@WithSpan` method, a Reactor operator or a worker thre
 ```java
 // tracing/RequestSpan.java  ➕
 public final class RequestSpan {
-  private static final ContextKey<Span> ROOT = ContextKey.named("{{PREFIX}}-root-span");
+  private static final ContextKey<Span> ROOT = ContextKey.named("request-root-span");
   /** call in the door filter: makes the SERVER span reachable from every child scope on this request */
-  public static Scope open(Span root) { return Context.current().with(ROOT, root).with(WRITTEN, ConcurrentHashMap.newKeySet()).makeCurrent(); }
+  public static Scope open(Span root) { return Context.current().with(ROOT, root).with(WRITTEN, ConcurrentHashMap.newKeySet()).with(FAILURES, new AtomicInteger()).makeCurrent(); }
   public static Span root() { Span s = Context.current().get(ROOT); return s != null ? s : Span.current(); }
   public static void set(String key, String v) { if (v != null) root().setAttribute(key, v); }
   public static void set(String key, long v)   { root().setAttribute(key, v); }
@@ -281,11 +325,34 @@ public final class RequestSpan {
   public static void here(String key, String v){ Span.current().setAttribute(key, v); }   // on the innermost span
   /** first writer wins (the OTel API cannot read attributes back): a per-request Set<String> of written keys travels in the same Context */
   public static void setIfAbsent(String key, Object v) { Set<String> w = Context.current().get(WRITTEN); if (w == null || w.add(key)) setAny(root(), key, v); }
-  public static final String KEY = "{{PREFIX}}-root-span";                                        // WebFlux: Reactor context key (§3)
-  private static final ContextKey<Set<String>> WRITTEN = ContextKey.named("{{PREFIX}}-written");
+  /** 03 §2.1: a call the request carried on past. Key = <call>.failure with <call> = "<dependency>.<action>" (e.g. "support-case.create"); value = short reason.
+   *  First failure of a call wins; failure_count = number of calls that failed on this request (a query cannot match attribute names by pattern). */
+  public static void failure(String call, String reason) {
+    String key = AttrName.of(call + ".failure");                                                // company prefix added only when the dependency name is an OpenTelemetry namespace (00 §6)
+    Set<String> w = Context.current().get(WRITTEN); AtomicInteger n = Context.current().get(FAILURES);
+    if (w == null || n == null || !w.add(key)) return;                                         // outside a request/job scope, or this call already recorded — the log line (SpanOutcome) is the record
+    root().setAttribute(key, reason);                                                            // "HTTP 503" | "timeout" | "connection refused" | "retries exhausted (3)" | exception simple class name
+    root().setAttribute("failure_count", n.incrementAndGet());
+  }
+  public static final String KEY = "request-root-span";                                        // WebFlux: Reactor context key (§3)
+  private static final ContextKey<Set<String>> WRITTEN = ContextKey.named("request-written-keys");
+  private static final ContextKey<AtomicInteger> FAILURES = ContextKey.named("request-failure-count");
 }
 ```
-`open()` is called **once**, in the door filter (§3), inside a try-with-resources around `chain.doFilter`; nothing else opens it. Arrays (`user.roles`) use `root().setAttribute(AttributeKey.stringArrayKey(...), list)`.
+```java
+// tracing/AttrName.java ➕ — the one place that decides whether a key needs the company prefix (00 §6)
+public final class AttrName {
+  private static final Set<String> OTEL_NAMESPACES = Set.of("android", "app", "artifact", "aspnetcore", "aws", "azure", "browser", "cassandra", "cicd", "client", "cloud", "cloudevents", "cloudfoundry", "code", "container", "cpu", "cpython", "db", "deployment", "destination", "device", "disk", "dns", "dotnet", "elasticsearch", "enduser", "error", "event", "exception", "faas", "feature_flag", "file", "gcp", "gen_ai", "geo", "go", "graphql", "heroku", "host", "http", "hw", "ios", "jsonrpc", "jvm", "k8s", "linux", "log", "mainframe", "mcp", "messaging", "network", "nfs", "nodejs", "oci", "onc_rpc", "openai", "openshift", "opentracing", "oracle_cloud", "oracledb", "os", "otel", "peer", "pprof", "process", "profile", "rpc", "security_rule", "server", "service", "session", "signalr", "source", "system", "telemetry", "test", "thread", "tls", "url", "user", "user_agent", "v8js", "vcs", "webengine", "zos");   // 00 §6 list; refresh from the registry
+  /** "support-case.create.failure" → unchanged; "db.write.failure" → "{{PREFIX}}.db.write.failure" */
+  public static String of(String key) {
+    int dot = key.indexOf('.'); String first = dot < 0 ? key : key.substring(0, dot);
+    return OTEL_NAMESPACES.contains(first) ? "{{PREFIX}}." + key : key;
+  }
+}
+```
+Use `AttrName.of(...)` for every key whose first group comes from a **name** (dependency, topic, job): `failure()` above already does; per-dependency keys do it at the call site (`RequestSpan.set(AttrName.of(dep + ".outcome"), "ignored")`). Fixed keys from §7 are written as they are — they never start with a namespace.
+
+`open()` is called **once per unit of work**, by the boundary that owns it: the door filter (§3) around `chain.doFilter`, `JobRun` (06 J1) around the job body, and the consumer listener (05 K3) around `process(record)` — always in a try-with-resources; nothing else opens it. Outside such a scope `root()` falls back to `Span.current()` and `failure()` has nowhere to write (it returns; the log line in `SpanOutcome` remains the record). Arrays (`user.roles`) use `root().setAttribute(AttributeKey.stringArrayKey(...), list)`.
 * The agent propagates `Context` through executors, `CompletableFuture`, WebClient/Reactor and Kafka consumers, so `RequestSpan.root()` works on worker threads and inside operators (⚠ verify once in a non-production environment with the agent on: a `RequestSpan.set` from an `@Async` method appears on the SERVER span).
 * Authorisation, grants, impersonation and outcome attributes go on the **root** (`RequestSpan.set`); decisions local to a fan-out unit go on the **current** span (`RequestSpan.here`) — and, if they change the response, also on the root.
 * **MDC is not `Context`.** Use the MDC-aware executors that usually already exist (an MDC-copying `ThreadPoolTaskExecutor`, a `TaskDecorator`, a Reactor MDC hook) for any traced work off the request thread; never `CompletableFuture.runAsync(task)` on the common pool (a typical defect: an async e-mail dispatch whose log lines have no correlation id).
@@ -296,23 +363,23 @@ public final class RequestSpan {
 
 **Standard (set by the agent or by the rules above; keep these names exactly):** `http.request.method`, `http.route`, `http.response.status_code`, `url.path`, `server.address`, `client.address`, `user_agent.original`, `http.request.header.<name>` (captured headers), `db.system`, `db.statement`, `db.operation`, `messaging.*` (05), `peer.service`, `error.type`, `exception.type|message|stacktrace`, `user.name`, `user.id`, `user.roles`, `session.id`, `feature_flag.key`, `feature_flag.result.variant`, `feature_flag.provider.name`, `code.function.name`, `thread.name`.
 
-**Company (`{{PREFIX}}.`, snake_case, string/number/bool):**
+**Our own names (no prefix — 00 §6: meaningful, dot-separated groups, snake_case words, never starting with an OpenTelemetry namespace; every fixed key below was checked against the registry; keys that start with a dependency/topic/job name go through `AttrName.of` (§6) and get the company prefix only when that name is a namespace; string/number/bool):**
 
 | Group | Keys |
 |---|---|
-| Door | `{{PREFIX}}.correlation_id`, `{{PREFIX}}.correlation_id_generated`, `{{PREFIX}}.org_id`, `{{PREFIX}}.channel_type`, `{{PREFIX}}.source_app`, `{{PREFIX}}.env`, `{{PREFIX}}.actor.present`, `{{PREFIX}}.actor.user_name` (masked), `{{PREFIX}}.actor.org_id` |
-| Authn | `{{PREFIX}}.authn.source`, `{{PREFIX}}.authn.result`, `{{PREFIX}}.authn.token_type` |
-| Authz | `{{PREFIX}}.authz.provider`, `{{PREFIX}}.authz.policy`, `{{PREFIX}}.authz.decision` (overall), `{{PREFIX}}.authz.reason` (catalogue key), `{{PREFIX}}.authz.decided_by`, `{{PREFIX}}.authz.<provider>.decision\|policy\|reason` (per engine: policy-engine, identity, policy-sidecar, permission-api, db, role, spring-security), `{{PREFIX}}.authz.input.*` (booleans/counts), `{{PREFIX}}.authz.accounts_checked`, `{{PREFIX}}.authz.reseller_shortcut` |
-| Grants | `{{PREFIX}}.user.context_source`, `{{PREFIX}}.user.accounts_source`, `{{PREFIX}}.user.accounts_count`, `{{PREFIX}}.user.assets_count`, `{{PREFIX}}.user.hierarchy_enabled`, `{{PREFIX}}.user.is_internal`, `{{PREFIX}}.user.accounts_fallback` |
-| Impersonation | `{{PREFIX}}.impersonation` (`none\|user\|org`), `{{PREFIX}}.support_org_mode`, `{{PREFIX}}.internal_guard`, `{{PREFIX}}.effective.org_id`, `{{PREFIX}}.effective.user_name` (masked) |
-| Business ids | `{{PREFIX}}.customer_account`, `{{PREFIX}}.billing_account`, `{{PREFIX}}.account_number`, `{{PREFIX}}.invoice_number`, `{{PREFIX}}.order_number`, `{{PREFIX}}.document_id`, `{{PREFIX}}.site_id`, `{{PREFIX}}.project_id`, `{{PREFIX}}.reference_id`, `{{PREFIX}}.agreement_number`, `{{PREFIX}}.ticket_id`, `{{PREFIX}}.master_data_id`, `{{PREFIX}}.audit_id` (row written by a consumer/job) — extend with your own opaque ids, never names |
-| Decisions | `{{PREFIX}}.cache_hit`, `{{PREFIX}}.cache.name`, `{{PREFIX}}.fallback`, `{{PREFIX}}.skipped`, `{{PREFIX}}.skip_reason`, `{{PREFIX}}.<dep>.version`, `{{PREFIX}}.strategy`, `{{PREFIX}}.account.filter`, `{{PREFIX}}.gate.readonly`, `{{PREFIX}}.flag.<key>`, `{{PREFIX}}.validation.failed`, `{{PREFIX}}.validation.field_count`, `{{PREFIX}}.retry.attempts`, `{{PREFIX}}.retry.exhausted`, `{{PREFIX}}.timeout_ms` |
-| Shape / result | `{{PREFIX}}.page_size`, `{{PREFIX}}.page_offset`, `{{PREFIX}}.sort`, `{{PREFIX}}.search_scope`, `{{PREFIX}}.batch_size`, `{{PREFIX}}.<dep>.batches`, `{{PREFIX}}.parallelism`, `{{PREFIX}}.result_count`, `{{PREFIX}}.no_record`, `{{PREFIX}}.truncated` |
-| Outcome (03) | `{{PREFIX}}.error_code` (exactly the response body's code), `{{PREFIX}}.error_key`, `{{PREFIX}}.handled_error_code`, `{{PREFIX}}.upstream.name`, `{{PREFIX}}.upstream.status`, `{{PREFIX}}.upstream.code` (first failing dependency wins), `{{PREFIX}}.handled` (`mapped\|passthrough\|swallowed\|fallback\|treated_as_success\|retried\|fail_closed\|rethrown`) |
-| Handover (04) | `{{PREFIX}}.call.purpose`, `{{PREFIX}}.call.version`, `{{PREFIX}}.call.id`, `{{PREFIX}}.call.ids_count`, `{{PREFIX}}.call.flags`, `{{PREFIX}}.call.page_size`, `{{PREFIX}}.call.<purpose>.*` (several calls in one method), `{{PREFIX}}.call.response.id\|count\|status\|code\|correlation_id\|request_id`, `{{PREFIX}}.<dep>.outcome` (per dependency, on the root); auth step: `{{PREFIX}}.auth.provider`, `{{PREFIX}}.auth.grant`, `{{PREFIX}}.auth.token_source`, `{{PREFIX}}.auth.token_ttl_s`, `{{PREFIX}}.auth.result`, `{{PREFIX}}.auth.on_failure` |
-| Messaging (05) | `{{PREFIX}}.event.type`, `{{PREFIX}}.event.status`, `{{PREFIX}}.event.source`, `{{PREFIX}}.route` (handler chosen by event type), `{{PREFIX}}.consumer.action`, `{{PREFIX}}.publish.result`, `{{PREFIX}}.publish.attempt`, `{{PREFIX}}.publish.partition`, `{{PREFIX}}.publish.offset`, `{{PREFIX}}.correlation_id_generated` |
-| Jobs (06) | `{{PREFIX}}.job.name`, `{{PREFIX}}.job.run_id`, `{{PREFIX}}.job.trigger` (`scheduled\|api\|message\|cronjob\|manual`), `{{PREFIX}}.job.status` (`running\|success\|failed\|partial\|skipped_lock`), `{{PREFIX}}.job.batch_status` (raw Spring Batch status), `{{PREFIX}}.job.exit_code`, `{{PREFIX}}.job.lock`, `{{PREFIX}}.job.params` (names only), `{{PREFIX}}.job.execution_id`, `{{PREFIX}}.job.instance_id`, `{{PREFIX}}.job.step`, `{{PREFIX}}.job.step.execution_id\|status\|read\|write\|skip\|rollback`, `{{PREFIX}}.job.items_total\|processed\|failed\|skipped`, `{{PREFIX}}.check.<system>` (per-system comparison result of a monitoring run) |
-| UI (07) | `{{PREFIX}}.screen`, `{{PREFIX}}.mfe`, `{{PREFIX}}.endpoint`, `{{PREFIX}}.error_type`, `{{PREFIX}}.step` (phase of a long flow), `{{PREFIX}}.proxy.target` (BFF) |
+| Door | `correlation_id`, `correlation_id_generated`, `caller.service` (the calling service's name — `external`/`unknown` when none), `caller.source` (`mesh-cert\|gateway-header\|api-key\|jwt-client\|source-app-header\|none`), `caller.declared` (only when it differs), `org_id`, `channel_type`, `env`, `actor.present`, `actor.user_name` (masked), `actor.org_id` |
+| Authn | `authn.source`, `authn.result`, `authn.token_type` |
+| Authz | `authz.provider`, `authz.policy`, `authz.decision` (overall), `authz.reason` (catalogue key), `authz.decided_by`, `authz.<provider>.decision\|policy\|reason` (per engine: policy-engine, identity, policy-sidecar, permission-api, db, role, spring-security), `authz.input.*` (booleans/counts), `authz.accounts_checked`, `authz.reseller_shortcut` |
+| Grants | `grants.context_source`, `grants.accounts_source`, `grants.accounts_count`, `grants.assets_count`, `grants.hierarchy_enabled`, `grants.internal_user`, `grants.accounts_fallback` |
+| Impersonation | `impersonation` (`none\|user\|org`), `support_org_mode`, `internal_guard`, `effective.org_id`, `effective.user_name` (masked) |
+| Business ids | `customer_account`, `billing_account`, `account_number`, `invoice_number`, `order_number`, `document_id`, `site_id`, `project_id`, `reference_id`, `agreement_number`, `ticket_id`, `master_data_id`, `audit_id` (row written by a consumer/job) — extend with your own opaque ids, never names |
+| Decisions | `cache_hit`, `cache.name`, `fallback`, `skipped`, `skip_reason`, `<dep>.version`, `strategy`, `account.filter`, `gate.readonly`, `flag.<key>`, `validation.failed`, `validation.field_count`, `retry.count`, `retry.max`, `retry.outcome` (`succeeded\|exhausted\|aborted`, on the per-purpose retry span — 04 §4.4), `timeout_ms` |
+| Shape / result | `page_size`, `page_offset`, `sort`, `search_scope`, `batch_size`, `<dep>.batches`, `parallelism`, `result_count`, `no_record`, `truncated` |
+| Outcome (03) | `error_code` (exactly the response body's code — **hard failures only**, 03 §2.1), `error_key`, `<dependency>.<action>.failure` (one key per call the request carried on past; value = short reason `HTTP 503\|timeout\|connection refused\|retries exhausted (n)\|<ExceptionClass>`), `failure_count` (how many such keys), `upstream.name`, `upstream.status`, `upstream.code` (first failing dependency wins), `handled` (`mapped\|passthrough\|ignored\|fallback\|treated_as_success\|fail_closed\|rethrown`) |
+| Handover (04) | `call.purpose`, `call.version`, `call.id`, `call.ids_count`, `call.flags`, `call.page_size`, `call.<purpose>.*` (several calls in one method), `call.response.id\|count\|status\|code\|correlation_id\|request_id`, `<dep>.outcome` (per dependency, on the root); auth step: `auth.provider`, `auth.grant`, `auth.token_source`, `auth.token_ttl_s`, `auth.result`, `auth.on_failure` |
+| Messaging (05) | `event_type`, `event_status`, `event_source`, `route` (handler chosen by event type), `consumer.action`, `consumer.delivery_attempt` (redeliveries of this record before this one, from the retry-topic / error-handler attempt header), `publish.result`, `publish.partition`, `publish.offset`, `correlation_id_generated` |
+| Jobs (06) | `job.name`, `job.run_id`, `job.trigger` (`scheduled\|api\|message\|cronjob\|manual`), `job.status` (`running\|success\|failed\|partial\|skipped_lock`), `job.batch_status` (raw Spring Batch status), `job.exit_code`, `job.lock`, `job.params` (names only), `job.execution_id`, `job.instance_id`, `job.step`, `job.step.execution_id\|status\|read\|write\|skip\|rollback`, `job.items_total\|processed\|failed\|skipped`, `check.<system>` (per-system comparison result of a monitoring run) |
+| UI (07) | `screen`, `mfe`, `endpoint`, `error_type`, `step` (phase of a long flow), `proxy.target` (BFF) |
 
 Never: tokens, API keys, `Authorization`, OAuth secrets, SASL/cloud credentials, e-mails, names, addresses, phone numbers, request/response bodies, policy input documents, SQL literals (`db-statement-sanitizer` **on** everywhere — §8), lists of accounts.
 
@@ -330,23 +397,24 @@ Never: tokens, API keys, `Authorization`, OAuth secrets, SASL/cloud credentials,
 ## 9. Verification (TraceQL) and checklist
 
 ```
-{ resource.service.name = "<service name of the deployment>" && span.{{PREFIX}}.correlation_id = "<uuid>" }   -- the request and all its hops
-{ kind = server && span.{{PREFIX}}.authz.decision = "deny" } | by(span.{{PREFIX}}.authz.provider, span.{{PREFIX}}.authz.policy, span.{{PREFIX}}.authz.reason)
-{ kind = server && span.{{PREFIX}}.authz.decision = "error" }                                                  -- policy engine failures (fail-closed denies)
-{ kind = server && span.{{PREFIX}}.user.accounts_count = 0 && span.http.response.status_code = 200 }           -- silent empty answers
-{ kind = server && span.{{PREFIX}}.impersonation != "none" } | by(span.{{PREFIX}}.channel_type, span.http.route)
-{ kind = server && span.feature_flag.key = "applicationReadOnlyMode" && span.{{PREFIX}}.gate.readonly = "blocked" }
-{ kind = server && span.{{PREFIX}}.fallback != nil } | by(span.{{PREFIX}}.fallback)
-{ kind = server && span.{{PREFIX}}.correlation_id_generated = true } | by(span.http.route)                     -- clients that send no correlation id
+{ resource.service.name = "<service name of the deployment>" && span.correlation_id = "<uuid>" }   -- the request and all its hops
+{ kind = server && span.authz.decision = "deny" } | by(span.authz.provider, span.authz.policy, span.authz.reason)
+{ kind = server && span.authz.decision = "error" }                                                  -- policy engine failures (fail-closed denies)
+{ kind = server && span.grants.accounts_count = 0 && span.http.response.status_code = 200 }           -- silent empty answers
+{ kind = server && span.impersonation != "none" } | by(span.channel_type, span.http.route)
+{ kind = server && span.feature_flag.key = "applicationReadOnlyMode" && span.gate.readonly = "blocked" }
+{ kind = server && span.fallback != nil } | by(span.fallback)
+{ kind = server && span.correlation_id_generated = true } | by(span.http.route)                     -- clients that send no correlation id
 { span.http.route =~ ".*health.*" }                                                                             -- must be empty
 ```
 
 - [ ] §2 analysis table produced (file:line per decision) before any code
-- [ ] Door filter: correlation id read-or-generated once, MDC (existing key + `correlationId`), `{{PREFIX}}.correlation_id`, identity/actor/channel/session attributes, response header echoed; no tokens
+- [ ] Every attribute key the code writes is a registry attribute, a §7 key, or a new plain name that passes the 00 §6 check; keys built from a dependency/topic/job name go through `AttrName.of` (company prefix only when that name is an OpenTelemetry namespace)
+- [ ] Door filter: correlation id read-or-generated once, MDC (existing key + `correlationId`), `correlation_id`, `caller.service` + `caller.source` resolved per §3.1 (sources present today listed with file:line), identity/actor/channel/session attributes, response header echoed; no tokens
 - [ ] Authn result registered where validation happens; each authz engine registered where its answer is read (`provider/policy/decision/reason`), overall decision on the root; grants as counts + source; impersonation/support-org/channel switches; read-only/flag gates
 - [ ] Controller: business ids before the service call; service: defaults first, decisions/fallbacks/skips/versions/result counts; `@WithSpan` only on fan-out/async/hotspots
 - [ ] `RequestSpan` helper in place; async work on MDC-aware executors; no common-pool `runAsync`
-- [ ] Outcome per 03 (`error.type`, `{{PREFIX}}.error_code`, upstream status/code), handover per 04, messages per 05
+- [ ] Outcome per 03 (`error.type`, `error_code`, upstream status/code), handover per 04, messages per 05
 - [ ] Vocabulary §7 only; no PII/secrets/lists; `db-statement-sanitizer` on
 - [ ] Health routes dropped (collector filter covers this service's management path); propagators unified
 - [ ] Verified with the TraceQL above on one real request in an agent-enabled environment; log line ↔ trace by `trace_id`, log ↔ span ↔ error body by correlation id

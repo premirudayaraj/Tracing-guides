@@ -1,6 +1,6 @@
 # 07 — Browser (React MFEs / apps), Node BFFs and Node API servers
 
-> **Roles:** WEB-UI (React micro-frontends and standalone apps), BFF / NODE-SERVER (Koa, Express, Fastify — proxies and API servers), NODE CRONJOB (see 06 §J5). The same door/decision/handover rules as the Java guides, applied with the OpenTelemetry **web SDK** in the browser and the **Node SDK** on the server. Placeholders (`{{PREFIX}}`, `{{CORRELATION_HEADER}}`, `{{USER_HEADER}}`, `{{ORG_HEADER}}`, `{{CHANNEL_HEADER}}`, `{{SESSION_HEADER}}`, `{{ACTOR_USER_HEADER}}`, `{{ACTOR_ORG_HEADER}}`, `{{TRACE_BACKEND}}`…) are defined in `README.md §0`.
+> **Roles:** WEB-UI (React micro-frontends and standalone apps), BFF / NODE-SERVER (Koa, Express, Fastify — proxies and API servers), NODE CRONJOB (see 06 §J5). The same door/decision/handover rules as the Java guides, applied with the OpenTelemetry **web SDK** in the browser and the **Node SDK** on the server. Placeholders (`{{CORRELATION_HEADER}}`, `{{USER_HEADER}}`, `{{ORG_HEADER}}`, `{{CHANNEL_HEADER}}`, `{{SESSION_HEADER}}`, `{{ACTOR_USER_HEADER}}`, `{{ACTOR_ORG_HEADER}}`, `{{TRACE_BACKEND}}`…) are defined in `README.md §0`.
 >
 > **How to use with an AI assistant:** *"Trace `<mfe|bff>` per 07-UI-BFF-NODE.md: §2 inventory first, then U1–U7 / N1–N6."*
 >
@@ -25,9 +25,9 @@
 
 ```
  Browser (OTel web SDK, service.name=<portal>)                    Node BFF (OTel Node SDK, service.name=<bff>)             Java service (agent)
- user-interaction span "click submit"  {{PREFIX}}.screen=/billing/invoices/:id, {{PREFIX}}.mfe=billing
-   └─ fetch span "POST /api/billing/…"  {{PREFIX}}.endpoint=<template>, {{PREFIX}}.correlation_id=<C>  ──traceparent + {{CORRELATION_HEADER}}──►  SERVER span "POST /api/billing/…"
-        attrs after response: http.response.status_code, {{PREFIX}}.error_code (from ErrorDetails[0]), {{PREFIX}}.correlation_id (echoed)   {{PREFIX}}.correlation_id=<C>, user.name, {{PREFIX}}.proxy.target=billing
+ user-interaction span "click submit"  screen=/billing/invoices/:id, mfe=billing
+   └─ fetch span "POST /api/billing/…"  endpoint=<template>, correlation_id=<C>  ──traceparent + {{CORRELATION_HEADER}}──►  SERVER span "POST /api/billing/…"
+        attrs after response: http.response.status_code, error_code (from ErrorDetails[0]), correlation_id (echoed)   correlation_id=<C>, user.name, proxy.target=billing
                                                                                                                                     └─ CLIENT span → gateway → Java SERVER span (01)
 ```
 
@@ -55,7 +55,7 @@ Five invariants (same as the backend, restated for the web tier):
 // shell (or standalone app) only — copy the reference OpenTelemetry.js bootstrap
 startOtelInstrumentation(otelCollectorUrl /* browser-facing collector for the env ⚠ confirm where it comes from */, { serviceName: '<portal>', serviceVersion: BUILD, env: window.APP_ENV });
 // resource: service.name, service.version, deployment.environment, session.id (from the session cookie — same value as {{SESSION_HEADER}}), browser.* (SDK)
-// CustomSpanProcessor: user.name (masked), {{PREFIX}}.org_id, {{PREFIX}}.channel_type (internal portal marker), {{PREFIX}}.actor.org_id when set — on every span
+// CustomSpanProcessor: user.name (masked), org_id, channel_type (internal portal marker), actor.org_id when set — on every span
 registerInstrumentations({ instrumentations: [getWebAutoInstrumentations({
   '@opentelemetry/instrumentation-fetch':            { propagateTraceHeaderCorsUrls: [API_ORIGIN_RE], clearTimingResources: true },
   '@opentelemetry/instrumentation-xml-http-request': { propagateTraceHeaderCorsUrls: [API_ORIGIN_RE], clearTimingResources: true },
@@ -63,6 +63,7 @@ registerInstrumentations({ instrumentations: [getWebAutoInstrumentations({
   '@opentelemetry/instrumentation-user-interaction': { eventNames: ['click', 'submit'] },
 })]});
 ```
+* When copying the reference processor: keep `user.name` (masked); drop `user.email` (PII) and move `user.status` / `user.error` / `selected.user` out of the `user` namespace or drop them — `user` is an OpenTelemetry namespace and only its standard keys go there (00 §6).
 * MFEs: `const tracer = trace.getTracer('<mfe-name>')` from `@opentelemetry/api` — no provider, no exporter, no `WebTracerProvider` inside an MFE.
 * An existing RUM/EUM script stays where it exists (Core Web Vitals); OTel spans are for correlation with `{{TRACE_BACKEND}}`. Do not send the same custom events to both.
 
@@ -70,8 +71,8 @@ registerInstrumentations({ instrumentations: [getWebAutoInstrumentations({
 ```js
 // router listener (shell/MFE root)
 const span = tracer.startSpan('route ' + routeTemplate(location.pathname));   // "/billing/invoices/:invoiceId", never the concrete path
-span.setAttribute('{{PREFIX}}.screen', routeTemplate); span.setAttribute('{{PREFIX}}.mfe', 'billing'); span.end();
-// user-interaction spans (SDK) get {{PREFIX}}.screen / {{PREFIX}}.mfe from the CustomSpanProcessor (current route kept in a module variable)
+span.setAttribute('screen', routeTemplate); span.setAttribute('mfe', 'billing'); span.end();
+// user-interaction spans (SDK) get screen / mfe from the CustomSpanProcessor (current route kept in a module variable)
 ```
 
 ### U3 — Central HTTP layer: correlation id out, outcome in (the most important placement)
@@ -86,13 +87,13 @@ callContext.set(requestKey, { correlationId, endpointTemplate, screen: currentRo
 '@opentelemetry/instrumentation-fetch': { propagateTraceHeaderCorsUrls: [API_ORIGIN_RE],
   applyCustomAttributesOnSpan: async (span, request, response) => {                              // called once per fetch with the fetch span
     const c = callContext.take(keyOf(request)) ?? {};
-    span.setAttribute('{{PREFIX}}.correlation_id', c.correlationId); span.setAttribute('{{PREFIX}}.endpoint', c.endpointTemplate); span.setAttribute('{{PREFIX}}.screen', c.screen);
-    c.ids?.forEach(([k, v]) => span.setAttribute(k, v));                                         // {{PREFIX}}.account_number / {{PREFIX}}.invoice_number / {{PREFIX}}.order_number — opaque ids only
+    span.setAttribute('correlation_id', c.correlationId); span.setAttribute('endpoint', c.endpointTemplate); span.setAttribute('screen', c.screen);
+    c.ids?.forEach(([k, v]) => span.setAttribute(k, v));                                         // account_number / invoice_number / order_number — opaque ids only
     if (response instanceof Response && response.status >= 400) {
       const body = await safeJson(response.clone()); const first = Array.isArray(body) ? body[0] : body;   // ErrorDetails[] (02): errorCode, errorMessage, correlationId, additionalInfo
-      span.setAttribute('{{PREFIX}}.error_code', first?.errorCode ?? '-'); span.setAttribute('{{PREFIX}}.correlation_id', first?.correlationId ?? c.correlationId); span.setAttribute('{{PREFIX}}.error_type', 'api');
+      span.setAttribute('error_code', first?.errorCode ?? '-'); span.setAttribute('correlation_id', first?.correlationId ?? c.correlationId); span.setAttribute('error_type', 'api');
       if (response.status >= 500) span.setStatus({ code: SpanStatusCode.ERROR, message: first?.errorCode });   // 4xx: attribute only (03)
-    } else if (!(response instanceof Response)) { span.recordException(response); span.setAttribute('{{PREFIX}}.error_type', 'transport'); span.setStatus({ code: SpanStatusCode.ERROR }); }   // fetch rejected: CORS, timeout, network
+    } else if (!(response instanceof Response)) { span.recordException(response); span.setAttribute('error_type', 'transport'); span.setStatus({ code: SpanStatusCode.ERROR }); }   // fetch rejected: CORS, timeout, network
   } },
 '@opentelemetry/instrumentation-xml-http-request': { propagateTraceHeaderCorsUrls: [API_ORIGIN_RE], applyCustomAttributesOnSpan: (span, xhr) => { /* same, from xhr.status / xhr.responseText */ } },
 // a BFF's JSON may add `correlation-id`; prefer header/body value when present, else the generated one
@@ -100,13 +101,13 @@ callContext.set(requestKey, { correlationId, endpointTemplate, screen: currentRo
 Show `correlationId` on every error toast — that is what support pastes into `{{TRACE_BACKEND}}`.
 
 ### U4 — Uncaught render errors
-Top-level `ErrorBoundary.componentDidCatch` → `tracer.startSpan('render.error')` + `recordException(error)`, `{{PREFIX}}.error_type=render`, `{{PREFIX}}.mfe`, `{{PREFIX}}.screen`, first 250 chars of `componentStack`; end immediately.
+Top-level `ErrorBoundary.componentDidCatch` → `tracer.startSpan('render.error')` + `recordException(error)`, `error_type=render`, `mfe`, `screen`, first 250 chars of `componentStack`; end immediately.
 
 ### U5 — Business events and decisions in the UI
-Where: the action/thunk that performs the business step. One short span (`billing.invoice.download`, `order.create`) with ids only (`{{PREFIX}}.invoice_number`, `{{PREFIX}}.order_number`, `{{PREFIX}}.account_number`) and UI decisions that change what is requested: `{{PREFIX}}.channel_type` (internal portal), `{{PREFIX}}.actor.org_id` (masquerade selection), feature toggles from the shell (`feature_flag.key/result.variant`), selected filters as enums (`{{PREFIX}}.search_scope`), page size. Never titles, free text, form contents.
+Where: the action/thunk that performs the business step. One short span (`billing.invoice.download`, `order.create`) with ids only (`invoice_number`, `order_number`, `account_number`) and UI decisions that change what is requested: `channel_type` (internal portal), `actor.org_id` (masquerade selection), feature toggles from the shell (`feature_flag.key/result.variant`), selected filters as enums (`search_scope`), page size. Never titles, free text, form contents.
 
 ### U6 — Long flows
-Wrap upload → validate → submit in one parent span (`order.create.flow`) so the fetch spans group; end in `finally`; `{{PREFIX}}.step` attribute updated per phase.
+Wrap upload → validate → submit in one parent span (`order.create.flow`) so the fetch spans group; end in `finally`; `step` attribute updated per phase.
 
 ### U7 — Cross-origin propagation (browser → BFF → Java)
 1. `propagateTraceHeaderCorsUrls` must cover the API/BFF origin (verify whether the API is same-origin ⚠).
@@ -138,23 +139,26 @@ app.use(async (ctx, next) => {                                         // Koa; E
   const inbound = ctx.get('{{CORRELATION_HEADER}}') || ctx.get('<product-specific legacy header>');
   const cid = inbound || randomUUID();                                 // generate ONCE here when the browser sent none
   ctx.state.correlationId = cid; ctx.set('{{CORRELATION_HEADER}}', cid);   // echo (a BFF that already echoes it inside the JSON as `correlation-id` keeps both)
-  span?.setAttribute('{{PREFIX}}.correlation_id', cid); span?.setAttribute('{{PREFIX}}.correlation_id_generated', !inbound);
-  span?.setAttribute('user.name', mask(ctx.get('{{USER_HEADER}}'))); span?.setAttribute('{{PREFIX}}.org_id', ctx.get('{{ORG_HEADER}}')); span?.setAttribute('{{PREFIX}}.channel_type', ctx.get('{{CHANNEL_HEADER}}') || '-');
-  span?.setAttribute('{{PREFIX}}.actor.present', !!(ctx.get('{{ACTOR_USER_HEADER}}') || ctx.get('{{ACTOR_ORG_HEADER}}'))); span?.setAttribute('session.id', ctx.get('{{SESSION_HEADER}}'));
+  span?.setAttribute('correlation_id', cid); span?.setAttribute('correlation_id_generated', !inbound);
+  span?.setAttribute('user.name', mask(ctx.get('{{USER_HEADER}}'))); span?.setAttribute('org_id', ctx.get('{{ORG_HEADER}}')); span?.setAttribute('channel_type', ctx.get('{{CHANNEL_HEADER}}') || '-');
+  span?.setAttribute('actor.present', !!(ctx.get('{{ACTOR_USER_HEADER}}') || ctx.get('{{ACTOR_ORG_HEADER}}'))); span?.setAttribute('session.id', ctx.get('{{SESSION_HEADER}}'));
+  const caller = resolveCaller(ctx);                                   // 01 §3.1, same order: mesh cert → gateway header → api-key registry → jwt client claim → {{SOURCE_APP_HEADER}} → 'external' (browser traffic through the portal is external by definition) | 'unknown'
+  span?.setAttribute('caller.service', caller.name); span?.setAttribute('caller.source', caller.source); if (caller.declared) span?.setAttribute('caller.declared', caller.declared);
   await context.with(context.active().setValue(CID_KEY, cid), next);   // AsyncLocalStorage-backed: available to the logger and outbound interceptors
 });
 ```
+* A BFF's own outbound calls declare the BFF's name in `{{SOURCE_APP_HEADER}}` (04 §5) — the Java services behind it then register `caller.service=<bff>` instead of `unknown`.
 * Logger: a child logger per request with `correlationId`, `trace_id`, `span_id` (from `trace.getActiveSpan().spanContext()`) so `{{LOG_BACKEND}}` lines open in `{{TRACE_BACKEND}}`; a logger that already has `correlationId` gets the two ids added.
-* Authentication in this layer (if any — a header-rewriting `injectHeaders` only rewrites, a `serviceManager` forwards): register `{{PREFIX}}.authn.source=forwarded` + `{{PREFIX}}.authn.result=forwarded` when the token is only passed on, and the real `{{PREFIX}}.authn.result` (01 §4.1) when a token is parsed/validated here. Vault-injected API keys are never on spans.
+* Authentication in this layer (if any — a header-rewriting `injectHeaders` only rewrites, a `serviceManager` forwards): register `authn.source=forwarded` + `authn.result=forwarded` when the token is only passed on, and the real `authn.result` (01 §4.1) when a token is parsed/validated here. Vault-injected API keys are never on spans.
 
 ### N3 — Decisions in the BFF
-Route/feature switches (portal tier from an env variable, help-topics cache fallback, local-dev token), proxy target selection (`{{PREFIX}}.proxy.target=support-case|billing|orders`), response shaping (pagination, filtering) → attributes on the SERVER span per 01 §5 (`{{PREFIX}}.fallback`, `{{PREFIX}}.cache_hit`, `feature_flag.*`).
+Route/feature switches (portal tier from an env variable, help-topics cache fallback, local-dev token), proxy target selection (`proxy.target=support-case|billing|orders`), response shaping (pagination, filtering) → attributes on the SERVER span per 01 §5 (`fallback`, `cache_hit`, `feature_flag.*`).
 
 ### N4 — Outbound calls (handover)
-The SDK creates a CLIENT span per axios/`http`/proxy request. Apply 04: `peer.service` from a host table (`SpanProcessor.onStart` or `http` instrumentation `applyCustomAttributesOnSpan`), `{{CORRELATION_HEADER}}` from the request context on every outbound request (a `prepareApiConfig` that already spreads all inbound headers is kept, but the header is also set explicitly when generated in N2; an Express server that spreads `req.headers` likewise), `{{PREFIX}}.call.purpose`, decisive ids/flags before, response ids/status after, and `{{PREFIX}}.upstream.*` + `{{PREFIX}}.handled` (`swallowed` for a chat notification and a source-control cache fallback, `passthrough` for proxied 401–500). `http-proxy-middleware`: `onProxyReq` sets the header, `onProxyRes` registers `{{PREFIX}}.upstream.status` and the proxied `correlation-id`.
+The SDK creates a CLIENT span per axios/`http`/proxy request. Apply 04: `peer.service` from a host table (`SpanProcessor.onStart` or `http` instrumentation `applyCustomAttributesOnSpan`), `{{CORRELATION_HEADER}}` from the request context on every outbound request (a `prepareApiConfig` that already spreads all inbound headers is kept, but the header is also set explicitly when generated in N2; an Express server that spreads `req.headers` likewise), `call.purpose`, decisive ids/flags before, response ids/status after, and `upstream.*` + `handled` (`ignored` for a chat notification and a source-control cache fallback, `passthrough` for proxied 401–500). An ignored call failure also sets a key named after the call on the SERVER span — `<dependency>.<action>.failure` = short reason (`span.setAttribute(attrName('chat-webhook.error-notify.failure'), 'HTTP 500')`, where `attrName` is the Node twin of `AttrName.of` in 01 §6: same namespace list, adds `{{PREFIX}}.` only when the first group is an OpenTelemetry namespace) — and increments `failure_count` from a per-request counter kept in the request context (03 §2.1); it gets **no** `error_code`; a call under `axios-retry` (or a manual loop) is wrapped in its own per-purpose span `"<dependency> <purpose> retry"` with `retry.count` from the response config's `retryCount` (04 §4.4). `http-proxy-middleware`: `onProxyReq` sets the header, `onProxyRes` registers `upstream.status` and the proxied `correlation-id`.
 
 ### N5 — Errors
-Global error middleware (`handleErrorMiddleware`, the BFF error JSON): `error.type`, `{{PREFIX}}.error_code` when the upstream body has one, `recordException` once, ERROR only for 5xx/transport; the JSON keeps `correlation-id` (02/03 contract for the browser).
+Global error middleware (`handleErrorMiddleware`, the BFF error JSON): `error.type`, `upstream.code` when the proxied body carries the backend's code (with `handled=passthrough`) and `error_code` only for a code the BFF itself mints (03 rule A), `recordException` once, ERROR only for 5xx/transport; the JSON keeps `correlation-id` (02/03 contract for the browser). Only requests the BFF actually fails reach this middleware — that is the hard-failure rule of 03 §2.1 applied to Node: a failure absorbed in a route handler is a `<dependency>.<action>.failure` key (N4), not a code.
 
 ### N6 — Node CronJobs
 06 §J5.
@@ -166,14 +170,14 @@ Global error middleware (`handleErrorMiddleware`, the BFF error JSON): `error.ty
 | Group | Attributes |
 |---|---|
 | Resource | `service.name` (`<portal>`, `<standalone-ui>`, `<bff>`, `<api-server>`), `service.version`, `deployment.environment`, `session.id`, `browser.*` |
-| Navigation | `{{PREFIX}}.screen` (route template), `{{PREFIX}}.mfe`, `{{PREFIX}}.channel_type` |
-| API call | `{{PREFIX}}.endpoint` (template), `http.request.method`/`http.response.status_code` (SDK), `{{PREFIX}}.correlation_id` |
-| Errors | `{{PREFIX}}.error_code` (`{{ERR_PREFIX}}-…`), `{{PREFIX}}.error_type` (`api\|transport\|render`), `error.type`, `exception.*` |
-| Business ids | `{{PREFIX}}.account_number`, `{{PREFIX}}.billing_account`, `{{PREFIX}}.invoice_number`, `{{PREFIX}}.order_number`, `{{PREFIX}}.document_id` |
-| Identity (masked) | `user.name`, `{{PREFIX}}.org_id`, `{{PREFIX}}.actor.org_id`, `{{PREFIX}}.actor.present` |
-| BFF | `{{PREFIX}}.proxy.target`, `{{PREFIX}}.upstream.*`, `{{PREFIX}}.handled`, `peer.service` |
+| Navigation | `screen` (route template), `mfe`, `channel_type` |
+| API call | `endpoint` (template), `http.request.method`/`http.response.status_code` (SDK), `correlation_id` |
+| Errors | `error_code` (`{{ERR_PREFIX}}-…`), `error_type` (`api\|transport\|render`), `error.type`, `exception.*` |
+| Business ids | `account_number`, `billing_account`, `invoice_number`, `order_number`, `document_id` |
+| Identity (masked) | `user.name`, `org_id`, `actor.org_id`, `actor.present`, `caller.service` / `caller.source` (BFF door, 01 §3.1) |
+| BFF | `proxy.target`, `upstream.*`, `handled`, `peer.service` |
 
-Join keys: UI `{{PREFIX}}.correlation_id` == header `{{CORRELATION_HEADER}}` == BFF span == Java MDC/span == `ErrorDetails.correlationId`; UI `{{PREFIX}}.error_code` == backend `{{PREFIX}}.error_code`; `traceparent` links the tiers into one trace once U7 is done.
+Join keys: UI `correlation_id` == header `{{CORRELATION_HEADER}}` == BFF span == Java MDC/span == `ErrorDetails.correlationId`; UI `error_code` == backend `error_code`; `traceparent` links the tiers into one trace once U7 is done.
 
 ---
 
@@ -184,18 +188,18 @@ Tokens, cookies, `Authorization`, e-mails, names, free-text search strings, resp
 
 ## 7. Verification (TraceQL)
 ```
-{ resource.service.name = "<portal>" } | by(span.{{PREFIX}}.screen)                                              -- templates only, low cardinality
-{ resource.service.name = "<portal>" && span.http.response.status_code >= 400 } | by(span.{{PREFIX}}.endpoint, span.{{PREFIX}}.error_code)
-{ span.{{PREFIX}}.correlation_id = "<C>" }                                                                     -- browser span + BFF span + Java spans (one trace after U7; before it, several traces sharing the id)
-{ resource.service.name = "<bff>" && span.{{PREFIX}}.correlation_id_generated = true } | by(span.http.route)    -- MFEs that still send no id
+{ resource.service.name = "<portal>" } | by(span.screen)                                              -- templates only, low cardinality
+{ resource.service.name = "<portal>" && span.http.response.status_code >= 400 } | by(span.endpoint, span.error_code)
+{ span.correlation_id = "<C>" }                                                                     -- browser span + BFF span + Java spans (one trace after U7; before it, several traces sharing the id)
+{ resource.service.name = "<bff>" && span.correlation_id_generated = true } | by(span.http.route)    -- MFEs that still send no id
 { resource.service.name = "<bff>" && kind = client } | by(span.peer.service, span.http.response.status_code)
-{ resource.service.name = "<portal>" && name = "render.error" } | by(span.{{PREFIX}}.screen)
+{ resource.service.name = "<portal>" && name = "render.error" } | by(span.screen)
 ```
 
 ---
 
 ## 8. Checklist — one UI app, one Node server
 - [ ] UI: one provider per page (shell/standalone); MFEs on `@opentelemetry/api`; resource + masked user via `CustomSpanProcessor`; router spans by template; central HTTP layer sends `{{CORRELATION_HEADER}}` and the fetch/XHR `applyCustomAttributesOnSpan` hook lifts `errorCode`/`correlationId`/endpoint/screen onto the fetch span, 5xx/transport → ERROR; `ErrorBoundary` → `render.error`; business spans with ids only; `propagateTraceHeaderCorsUrls` + gateway CORS verified
-- [ ] Node: SDK first in the entry; health ignored; door middleware (correlation id read-or-generate once, echo, identity/channel/session attributes, request-scoped logger with `trace_id`); decisions as attributes; outbound per 04 with `peer.service` and `{{PREFIX}}.handled`; global error middleware sets `error.type`/`{{PREFIX}}.error_code`; `sdk.shutdown()` on exit
+- [ ] Node: SDK first in the entry; health ignored; door middleware (correlation id read-or-generate once, echo, identity/channel/session attributes, `caller.service`, request-scoped logger with `trace_id`); outbound calls declare the BFF's name in `{{SOURCE_APP_HEADER}}`; decisions as attributes; outbound per 04 with `peer.service` and `handled`; global error middleware sets `error.type`/`error_code`; `sdk.shutdown()` on exit
 - [ ] No tokens/PII; no concrete ids in names
-- [ ] Verified: `{ span.{{PREFIX}}.correlation_id = "<C>" }` returns browser, BFF and Java spans; a forced 5xx shows `{{PREFIX}}.error_code` on the browser span and the same code on the Java span
+- [ ] Verified: `{ span.correlation_id = "<C>" }` returns browser, BFF and Java spans; a forced 5xx shows `error_code` on the browser span and the same code on the Java span

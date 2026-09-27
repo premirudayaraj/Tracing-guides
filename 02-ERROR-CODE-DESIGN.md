@@ -49,7 +49,7 @@
 On failures the module id inside the error code says which service answered; on success nothing in the body does. The span's `resource.service.name` is the identifier (01).
 
 ### 1.2 A second code family may exist — keep it, register it the same way
-If a product line returns name-based codes (`<PRODUCT>-<NAME>`, e.g. `AUTHORIZATION_HEADER_MISSING` → 401, `ACT_ON_BEHALF_DENIED` → 403) with the trace id as `correlationId`, do not convert them to numbers; on the span the attribute is still `{{PREFIX}}.error_code` (with that value) and `error.type` (03), so one TraceQL works across both families.
+If a product line returns name-based codes (`<PRODUCT>-<NAME>`, e.g. `AUTHORIZATION_HEADER_MISSING` → 401, `ACT_ON_BEHALF_DENIED` → 403) with the trace id as `correlationId`, do not convert them to numbers; on the span the attribute is still `error_code` (with that value) and `error.type` (03), so one TraceQL works across both families.
 
 ---
 
@@ -130,7 +130,8 @@ Service (business rules)            ──────────────�
 Controller input (Bean Validation)  ── handler ──►  400 VALIDATION_FAILURE; accumulate every field error in additionalInfo (one reference throws on the FIRST violation — do not copy that)
 ```
 
-Two properties of this design that matter for tracing:
+Three properties of this design that matter for tracing:
+* **A code is minted only for a hard failure** — an operation the service itself fails and answers with an error body (or gives a record up to retry/DLT, or ends a job run `failed`). A failure the code catches and continues past (an ignored notification failure, a fallback value, a timeout reported as processed) gets **no** code in this service — it is a `<dependency>.<action>.failure` key on the span (03 §2.1); the code for that problem belongs to the service that actually failed. The catalogue therefore holds keys for outcomes the client can receive, not for every `catch` block.
 * **Downstream codes are not passed through** (except the documented 400/404 pass-through). A caller turns the upstream's code into its own `*_API_ERROR` and logs the original. The client sees where it *surfaced*, not where it *originated*. 03 §3 puts the origin on the span so support can still see it; ➕ if pass-through is ever wanted, carry the upstream code in `details`, never replace `errorCode`.
 * **Validation returns all fields** in the better reference; new code SHOULD accumulate (`additionalInfo[{property, reason}]`).
 

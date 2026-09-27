@@ -26,11 +26,11 @@ Put a value on the current span when **all** of the following hold:
 |---|---|---|---|
 | Q1 | **It decides or explains.** The value changes the code path, the upstream that is called, the data returned, or the status/error the caller gets — or it is the identifier someone will search for when that request is questioned. | `authz.decision=deny`, `support_org_mode=true`, `permitted accounts=0`, `upstream status=503`, `feature flag variant`, `account number`, `order number`, `Kafka offset` | a loop counter, a formatted message, an intermediate DTO |
 | Q2 | **It is known at a point in the code, once.** There is one place where the value becomes final (after the policy call, after the cache lookup, after the send acknowledgement). | the policy response handler, the send callback, the `@Recover` method | values that are recomputed in five places |
-| Q3 | **It is low-cardinality or an opaque id.** Enums, booleans, counts, status codes, error codes, and business identifiers (account, invoice, order, document, message id, offset). | `{{PREFIX}}.authz.reason=NOT_ENOUGH_PERMISSIONS`, `{{PREFIX}}.result_count=12`, `{{PREFIX}}.account_number=1234567` | free text, names, e-mails, addresses, payloads, SQL with literals |
+| Q3 | **It is low-cardinality or an opaque id.** Enums, booleans, counts, status codes, error codes, and business identifiers (account, invoice, order, document, message id, offset). | `authz.reason=NOT_ENOUGH_PERMISSIONS`, `result_count=12`, `account_number=1234567` | free text, names, e-mails, addresses, payloads, SQL with literals |
 | Q4 | **It is not a secret and not PII.** | masked user (`abc…xyz`), org id, user key | JWT, API key, `Authorization`, OAuth tokens, passwords, SASL config, e-mail, full name, phone |
 | Q5 | **It would be wanted in an alert or a support ticket.** "Show me every request today where the policy decision was deny for policy billing/get", "every consumer record skipped because the account number was empty", "every send whose retry was exhausted". | | values only a debugger needs |
 
-If Q1–Q5 pass → **attribute on the current span**, set *as soon as the value is known*, with a *default written before the branch* so the key exists on every span (`{{PREFIX}}.cache_hit=false` then `true`).
+If Q1–Q5 pass → **attribute on the current span**, set *as soon as the value is known*, with a *default written before the branch* so the key exists on every span (`cache_hit=false` then `true`).
 
 Do **not** create a new span to hold a decision. Spans are for **units of work with duration** (an HTTP call, a query, a message hop, a fan-out method, a job run); decisions are attributes on the span that made them. Do not use span *events* for decisions either — the OpenTelemetry project is deprecating the span-events API in favour of logs; keep decisions as attributes and exceptions as `recordException` (still supported) or a log line carrying `trace_id`.
 
@@ -38,13 +38,13 @@ Do **not** create a new span to hold a decision. Spans are for **units of work w
 
 | Where | Registered |
 |---|---|
-| Door of every root span (HTTP server, Kafka/Rabbit consumer, scheduled/batch/CronJob run, browser action) | `{{PREFIX}}.correlation_id`; identity of the caller / actor / channel (01 §3); for messages the message id, key, partition, offset, consumer group (05); for jobs the job name, trigger and run id (06) |
+| Door of every root span (HTTP server, Kafka/Rabbit consumer, scheduled/batch/CronJob run, browser action) | `correlation_id`; identity of the caller / actor / channel (01 §3); for messages the message id, key, partition, offset, consumer group (05); for jobs the job name, trigger and run id (06) |
 | Authentication + authorisation chain (filters, interceptors, aspects, policy engine / identity service / permission API / DB ownership checks) | source of identity, decision (`allow`/`deny`/`error`), policy or action evaluated, reason code, what the user was granted (counts of permitted accounts / assets / roles), impersonation mode (01 §4) |
 | Every decision on the path | feature flag variant, cache hit/miss, fallback taken, filter that skipped work, chosen upstream/version, result count, "no record" outcomes (01 §5) |
-| Every outbound call (HTTP to another internal service or a third party, incl. token/auth calls) | the dependency name, the request's key identifiers/flags, the response's identifiers and status, and the **decision made on the outcome** (mapped error code, swallowed, retried, fallback) (04) |
+| Every outbound call (HTTP to another internal service or a third party, incl. token/auth calls) | the dependency name, the request's key identifiers/flags, the response's identifiers and status, and the **decision made on the outcome** (mapped error code, ignored → a `<dependency>.<action>.failure` key, fallback) (04); a retried call has its own per-purpose span with a retry **count** (04 §4.4) |
 | Every message published | topic/exchange, key, message id, the **acknowledgement** (partition + offset from the broker, or failure/retry-exhausted) (05) |
-| Every message consumed | topic, partition, offset, key, consumer group, message id from the payload/header, the correlation id restored from the record, the processing outcome incl. **skipped/swallowed** (05) |
-| Every failure | `error.type` (standard) + `{{PREFIX}}.error_code` (`{{ERR_PREFIX}}-<module><code>`), `recordException` once, status `ERROR` only when the operation really failed (03) |
+| Every message consumed | topic, partition, offset, key, consumer group, message id from the payload/header, the correlation id restored from the record, the processing outcome incl. **skipped / ignored** (05) |
+| Every failure | **hard failure** (the program failed the operation): `error.type` (standard) + `error_code` (`{{ERR_PREFIX}}-<module><code>`), `recordException` once, status `ERROR` only when the operation really failed; **non-fatal error** (caught, the request carried on): one key per failed call, `<dependency>.<action>.failure` = short reason, + `failure_count`, no code (03 §2.1) |
 
 ---
 
@@ -127,6 +127,7 @@ The rules in 01–07 are written for case 1 (agent on) and stay harmless when th
 | Node BFF / server | OTel Node SDK SERVER span | 07 §N | 07 §8 |
 | React MFE / web app | OTel web SDK (document-load, fetch/XHR, user-interaction) | 07 §U | 07 §8 |
 | Library | no spans of its own except at the I/O it owns; exposes hooks | §5 | — |
+| **Every role, after the code** | — | 09 (publish the service's trace documentation page to Confluence: repository name = page title, fixed template) | 09 §6 |
 | Other languages (Python, others) | OTel SDK of that language, same collector, same vocabulary; the placement guides are written for JVM/Node/browser — apply their rules by analogy, no separate guide | 00 §6 | — |
 
 ---
@@ -135,23 +136,48 @@ The rules in 01–07 are written for case 1 (agent on) and stay harmless when th
 
 * A library **never** starts a tracer provider, never sets `service.name`, never adds an exporter. It uses `io.opentelemetry:opentelemetry-api` only (`Span.current()`, `@WithSpan` from `opentelemetry-instrumentation-annotations`), which is a no-op unless the host application has the agent or an SDK.
 * A library that owns an I/O boundary (a notification library that owns the Kafka producer for e-mail; the in-house REST library that owns the WebClient factory and the request filter; a common library that owns the Kafka config helper and the MDC filter; an outbox library that owns the deferred-task runner; a kafka-support library that owns the listener container factory) is **where the door/handover rules are implemented once** for every host: correlation-id header injection and restoration (05 §K1–K2), `peer.service` naming (04), MDC restoration. Fix the library, not every caller.
-* A library must **expose the hook** the host needs to register decisions: e.g. a `sendEmail(...)` that publishes to Kafka should return the send result (topic, partition, offset, message id) so the host can register the acknowledgement (05 §K1) — a library that returns nothing and swallows errors hides the outcome from every host.
+* A library must **expose the hook** the host needs to register decisions: e.g. a `sendEmail(...)` that publishes to Kafka should return the send result (topic, partition, offset, message id) so the host can register the acknowledgement (05 §K1) — a library that returns nothing and hides its own errors hides the outcome from every host.
 * Libraries used only for tests, CLIs, code generators: nothing.
 
 ---
 
-## 6. Standard names first, `{{PREFIX}}.*` second
+## 6. Naming — standard names first, then plain meaningful names
 
-Use the OpenTelemetry semantic-convention attribute when one exists; use the `{{PREFIX}}.` prefix only for company concepts. The full vocabulary is in 01 §7; the rule of thumb:
+Use the OpenTelemetry semantic-convention attribute when one exists. For everything the standard does not cover, write a plain, meaningful name — **no company prefix**:
+* lower-case; dots separate groups, underscores separate words inside a group (`authz.decision`, `job.run_id`, `correlation_id`); dependency names keep their own hyphens, exactly as in `peer.service` (`support-case.create.failure`);
+* the name says what the value is when read on its own in a trace (`grants.accounts_count`, not `count`);
+* **never start with an OpenTelemetry namespace.** The first group must not be a namespace of the attribute registry (https://opentelemetry.io/docs/specs/semconv/registry/attributes/) — the ones most likely to be hit: `http`, `url`, `server`, `client`, `network`, `db`, `messaging`, `rpc`, `user`, `enduser`, `session`, `error`, `exception`, `event`, `code`, `service`, `peer`, `source`, `destination`, `app`, `feature_flag`, `log`, `file`, `process`, `thread`, `host`, `container`, `k8s`, `cloud`, `deployment`, `telemetry`, `otel`, `test`. OpenTelemetry's own naming guidance says not to reuse its namespaces for custom attributes, because a later release or an instrumentation library can define the same key with another meaning. That is why the guides use `grants.accounts_count` (not `user.accounts_count`) and `event_type` (not `event.type`). A single-group name such as `error_code` or `failure_count` is not inside a namespace (`error_code` is not `error.*`) and is fine;
+* only when the natural name would start with a namespace and no better word exists — typically a dependency whose name *is* a namespace, e.g. a service literally called `db` or `messaging` — put `{{PREFIX}}.` (README §0) in front of **that key only**: `{{PREFIX}}.db.write.failure`. That is the only use of the company prefix.
+
+When the prefix is added, and by whom:
+
+| Kind of key | Example | Prefix? | Who decides |
+|---|---|---|---|
+| Standard OpenTelemetry key | `http.route`, `user.name`, `error.type`, `messaging.message.id` | never — it *is* the standard | the key exists in the registry |
+| Our fixed keys (the vocabulary of 01 §7) | `correlation_id`, `authz.decision`, `grants.accounts_count`, `event_type`, `job.run_id` | no — every fixed key in 01 §7 was checked against the registry | the guides |
+| Keys whose first group is a **dependency, topic or job name** | `<dependency>.<action>.failure`, `<dependency>.outcome`, `<dependency>.version` (keys like `check.<system>` or `call.<purpose>.*` start with a fixed word and are safe) | **only if** that name is a namespace: `support-case.create.failure` → no prefix; `db.write.failure` → `{{PREFIX}}.db.write.failure` | the `AttrName.of(...)` helper (01 §6, Node: `attrName(...)` in 07 N4) — the code decides at runtime, the assistant never has to remember |
+| A new key the assistant invents for this service | `invoice.download_format` | no, unless its first group is a namespace — then rename it first; prefix only if no better word exists | the check below, run before the run finishes |
+
+The namespace list (the registry's namespaces, September 2026 — refresh from the registry link above when it changes): android, app, artifact, aspnetcore, aws, azure, browser, cassandra, cicd, client, cloud, cloudevents, cloudfoundry, code, container, cpu, cpython, db, deployment, destination, device, disk, dns, dotnet, elasticsearch, enduser, error, event, exception, faas, feature_flag, file, gcp, gen_ai, geo, go, graphql, heroku, host, http, hw, ios, jsonrpc, jvm, k8s, linux, log, mainframe, mcp, messaging, network, nfs, nodejs, oci, onc_rpc, openai, openshift, opentracing, oracle_cloud, oracledb, os, otel, peer, pprof, process, profile, rpc, security_rule, server, service, session, signalr, source, system, telemetry, test, thread, tls, url, user, user_agent, v8js, vcs, webengine, zos.
+
+The check the assistant runs on the project before ticking any checklist (it lists every key the code writes whose first group is a namespace; each printed key must be a real registry attribute — anything else is ours and must be renamed or prefixed):
+```sh
+NS="android|app|artifact|aspnetcore|aws|azure|browser|cassandra|cicd|client|cloud|cloudevents|cloudfoundry|code|container|cpu|cpython|db|deployment|destination|device|disk|dns|dotnet|elasticsearch|enduser|error|event|exception|faas|feature_flag|file|gcp|gen_ai|geo|go|graphql|heroku|host|http|hw|ios|jsonrpc|jvm|k8s|linux|log|mainframe|mcp|messaging|network|nfs|nodejs|oci|onc_rpc|openai|openshift|opentracing|oracle_cloud|oracledb|os|otel|peer|pprof|process|profile|rpc|security_rule|server|service|session|signalr|source|system|telemetry|test|thread|tls|url|user|user_agent|v8js|vcs|webengine|zos"
+grep -rhoE "(setAttribute|RequestSpan\.(set|setIfAbsent|here))\(\s*[\"'][a-z_][^\"']*[\"']" src 2>/dev/null | sed -E "s/.*[\"']([^\"']+)[\"']$/\1/" | sort -u | grep -E "^($NS)\."
+# example output:  user.name  session.id  → registry attributes, fine;   user.accounts_count  event.type  db.custom → ours: rename (grants.accounts_count, event_type) or prefix
+```
+
+The full vocabulary is in 01 §7; the rule of thumb:
 
 | Concept | Use | Not |
 |---|---|---|
-| HTTP method / route / status | `http.request.method`, `http.route`, `http.response.status_code` (agent) | `{{PREFIX}}.status` |
-| Dependency name | `peer.service` (agent mapping) | `{{PREFIX}}.upstream_host` |
-| Caller identity | `user.name` (masked login), `user.id` (user key), `user.roles`, `enduser.id` only when the raw id is allowed | `{{PREFIX}}.user` |
-| Failure type | `error.type` (exception class or domain code) + `{{PREFIX}}.error_code` (`{{ERR_PREFIX}}-…`) | `{{PREFIX}}.exception` |
-| Feature flag | `feature_flag.key`, `feature_flag.result.variant`, `feature_flag.provider.name` (one flag per span) or `{{PREFIX}}.flag.<key>=<variant>` when several flags decide one request | `{{PREFIX}}.<vendor>_flag` |
-| Message identity | `messaging.message.id`, `messaging.message.conversation_id` (= correlation id), `messaging.kafka.offset`, `messaging.destination.partition.id`, `messaging.kafka.message.key`, `messaging.consumer.group.name`, `messaging.rabbitmq.destination.routing_key`, `messaging.rabbitmq.message.delivery_tag` | `{{PREFIX}}.offset` |
-| Session | `session.id` (browser / `{{SESSION_HEADER}}`) | `{{PREFIX}}.session` |
+| HTTP method / route / status | `http.request.method`, `http.route`, `http.response.status_code` (agent) | `status` |
+| Dependency name | `peer.service` (agent mapping) | `upstream_host` |
+| Caller identity (person) | `user.name` (masked login), `user.id` (user key), `user.roles`, `enduser.id` only when the raw id is allowed | `user` |
+| Calling **service** (inbound) | `caller.service` (the caller's `service.name`; `external`/`unknown` when none) + `caller.source` (how it was obtained: mesh cert, gateway header, api-key registry, jwt client claim, self-declared header) — no standard key exists for this; `client.address` stays the agent's IP (01 §3.1) | `caller_ip`, `source_app`, a hostname |
+| Failure type | `error.type` (exception class or domain code) + `error_code` (`{{ERR_PREFIX}}-…`) on hard failures; `<dependency>.<action>.failure` (short reason) + `failure_count` on non-fatal ones; `retry.count` on per-purpose retry spans | `exception`, `handled_error_code`, `retry.attempt_<n>` |
+| Feature flag | `feature_flag.key`, `feature_flag.result.variant`, `feature_flag.provider.name` (one flag per span) or `flag.<key>=<variant>` when several flags decide one request | `<vendor>_flag` |
+| Message identity | `messaging.message.id`, `messaging.message.conversation_id` (= correlation id), `messaging.kafka.offset`, `messaging.destination.partition.id`, `messaging.kafka.message.key`, `messaging.consumer.group.name`, `messaging.rabbitmq.destination.routing_key`, `messaging.rabbitmq.message.delivery_tag` | `offset` |
+| Session | `session.id` (browser / `{{SESSION_HEADER}}`) | `session` |
 | Code location of a manual span | `code.function.name` (agent sets it for `@WithSpan`) | — |
-| Company business ids and decisions | `{{PREFIX}}.correlation_id`, `{{PREFIX}}.account_number`, `{{PREFIX}}.authz.*`, `{{PREFIX}}.job.*`, `{{PREFIX}}.consumer.action`, `{{PREFIX}}.publish.result` … | ad-hoc names |
+| Our business ids and decisions | `correlation_id`, `account_number`, `authz.*`, `job.*`, `consumer.action`, `publish.result` … | ad-hoc names |

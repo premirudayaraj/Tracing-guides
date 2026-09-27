@@ -1,6 +1,6 @@
 # 06 — Scheduled Jobs, Spring Batch and Kubernetes CronJobs: A Root Span per Run
 
-> **Roles:** SCHEDULED (`@Scheduled` business jobs inside a service), BATCH (Spring Batch), CRONJOB (Kubernetes CronJob — Node, Java or Python process that runs to completion), plus backfills/reconciliations triggered by API or message. Token/config refreshers are covered because they exist in almost every service, but they are traced differently (J2). Placeholders (`{{PREFIX}}`, `{{CORRELATION_HEADER}}`, `{{ERR_PREFIX}}`, `{{TRACE_BACKEND}}`, `{{LOG_BACKEND}}`…) are defined in `README.md §0`.
+> **Roles:** SCHEDULED (`@Scheduled` business jobs inside a service), BATCH (Spring Batch), CRONJOB (Kubernetes CronJob — Node, Java or Python process that runs to completion), plus backfills/reconciliations triggered by API or message. Token/config refreshers are covered because they exist in almost every service, but they are traced differently (J2). Placeholders (`{{CORRELATION_HEADER}}`, `{{ERR_PREFIX}}`, `{{TRACE_BACKEND}}`, `{{LOG_BACKEND}}`…) are defined in `README.md §0`.
 >
 > **How to use with an AI assistant:** *"Trace the jobs of `<service>` per 06-SCHEDULED-BATCH-CRONJOB.md: §2 inventory first, then J1–J5."*
 >
@@ -25,10 +25,10 @@
 
 ```
  ROOT span  "MonthlyReportJob.run"        kind=INTERNAL (no parent)                     ← one per run; ➕ created by code
-   attrs: {{PREFIX}}.job.name=monthly-report, {{PREFIX}}.job.trigger=cronjob|scheduled|api|message|manual, {{PREFIX}}.job.run_id=<uuid>, {{PREFIX}}.correlation_id=<same uuid>,
-          {{PREFIX}}.job.execution_id=<JobExecution id>, {{PREFIX}}.job.params=startTimeStamp (names only), {{PREFIX}}.job.status=success|failed|partial,
-          {{PREFIX}}.job.items_total/processed/failed/skipped, {{PREFIX}}.job.exit_code, feature_flag.* for gates, {{PREFIX}}.job.lock=acquired|held_by_other (ShedLock/DB lock)
-   ├─ INTERNAL "step LockDataForCurrentReport"   {{PREFIX}}.job.step=…, {{PREFIX}}.job.step.status=COMPLETED, read/write/skip counts
+   attrs: job.name=monthly-report, job.trigger=cronjob|scheduled|api|message|manual, job.run_id=<uuid>, correlation_id=<same uuid>,
+          job.execution_id=<JobExecution id>, job.params=startTimeStamp (names only), job.status=success|failed|partial,
+          job.items_total/processed/failed/skipped, job.exit_code, feature_flag.* for gates, job.lock=acquired|held_by_other (ShedLock/DB lock)
+   ├─ INTERNAL "step LockDataForCurrentReport"   job.step=…, job.step.status=COMPLETED, read/write/skip counts
    │    ├─ JDBC …                                                    (agent)
    │    └─ CLIENT POST peer.service=ticketing                       (agent; 04 rules apply)
    └─ INTERNAL "step EndMonthlyReport"
@@ -36,10 +36,10 @@
 ```
 
 Four invariants:
-1. **One root span per run** (not per tick of a keep-alive, not per item). A run that does no work still produces a short span with `{{PREFIX}}.job.items_total=0` — "did it run?" is the first support question.
-2. **A run id is a correlation id.** Generate a UUID at the start of the run, put it in MDC (`correlationId`), on the span (`{{PREFIX}}.correlation_id` + `{{PREFIX}}.job.run_id`), into every row/message/notification the run produces (chat text, DB columns, Kafka headers via 05 K1).
+1. **One root span per run** (not per tick of a keep-alive, not per item). A run that does no work still produces a short span with `job.items_total=0` — "did it run?" is the first support question.
+2. **A run id is a correlation id.** Generate a UUID at the start of the run, put it in MDC (`correlationId`), on the span (`correlation_id` + `job.run_id`), into every row/message/notification the run produces (chat text, DB columns, Kafka headers via 05 K1).
 3. **Counts, not items.** `items_total/processed/failed/skipped` on the root; the agent's CLIENT/JDBC/PRODUCER children show the per-item work. One `@WithSpan` per *phase/step*, never per item.
-4. **Infrastructure refreshers are traced as outcomes, not as work**: a token refresh gets one short span with `{{PREFIX}}.auth.*` (04 §4.2) and `{{PREFIX}}.job.status`; keep-alives get nothing.
+4. **Infrastructure refreshers are traced as outcomes, not as work**: a token refresh gets one short span with `auth.*` (04 §4.2) and `job.status`; keep-alives get nothing.
 
 ---
 
@@ -59,32 +59,34 @@ public void reconcile() { JobRun.run("account-reconcile", "scheduled", this::doR
 
 // ➕ <package>/tracing/JobRun.java — one helper per service (no framework)
 public final class JobRun {
-  private static final Tracer T = GlobalOpenTelemetry.getTracer("{{PREFIX}}.jobs");             // resolves to the agent / in-app OTel SDK; a no-op tracer without either (then only the MDC + log parts below take effect)
+  private static final Tracer T = GlobalOpenTelemetry.getTracer("job-run");                    // resolves to the agent / in-app OTel SDK; a no-op tracer without either (then only the MDC + log parts below take effect)
   public static void run(String job, String trigger, Runnable body) { run(job, trigger, () -> { body.run(); return null; }); }
   public static <R> R run(String job, String trigger, Supplier<R> body) {
     boolean scheduled = "scheduled".equals(trigger) || "cronjob".equals(trigger);
     String runId = scheduled ? UUID.randomUUID().toString() : firstNonBlank(MDC.get("correlationId"), UUID.randomUUID().toString());   // api/message triggers keep the request's correlation id
     SpanBuilder b = T.spanBuilder(job + ".run").setSpanKind(SpanKind.INTERNAL);
     if (scheduled) b.setNoParent();                                                             // fresh trace per scheduled run; api/message runs stay INSIDE the triggering trace; stored work → a link (05 K8)
-    Span span = b.setAttribute("{{PREFIX}}.job.name", job).setAttribute("{{PREFIX}}.job.trigger", trigger).setAttribute("{{PREFIX}}.job.run_id", runId)
-                 .setAttribute("{{PREFIX}}.correlation_id", runId).setAttribute("{{PREFIX}}.job.status", "running").startSpan();
+    Span span = b.setAttribute("job.name", job).setAttribute("job.trigger", trigger).setAttribute("job.run_id", runId)
+                 .setAttribute("correlation_id", runId).setAttribute("job.status", "running").startSpan();
     Map<String, String> savedMdc = MDC.getCopyOfContextMap();                                   // restore, never clear, on a request thread
     MDC.put("correlationId", runId); MDC.put("<this service's existing MDC key>", runId); MDC.put("jobRunId", runId);
     try (Scope s = span.makeCurrent(); Scope r = RequestSpan.open(span)) {
-      R out = body.get(); span.setAttribute("{{PREFIX}}.job.status", "success"); return out;
-    } catch (Exception e) { span.setAttribute("{{PREFIX}}.job.status", "failed"); SpanOutcome.record("{{ERR_PREFIX}}-<module>030", "JOB_FAILED", 500, e); throw e; }   // 03: recordException once + ERROR + {{PREFIX}}.error_code
+      R out = body.get(); span.setAttribute("job.status", "success"); return out;
+    } catch (Exception e) { span.setAttribute("job.status", "failed"); SpanOutcome.record("{{ERR_PREFIX}}-<module>030", "JOB_FAILED", 500, e); throw e; }   // 03: recordException once + ERROR + error_code
+    // a run that CONTINUES past a failed step or item is not a failed run: count it (job.items_failed, status=partial) and, for a whole skipped phase, SpanOutcome.nonFatal("<job>.<phase>", e) → <job>.<phase>.failure, no code (03 §2.1)
     finally { span.end(); if (savedMdc == null) MDC.clear(); else MDC.setContextMap(savedMdc); }
   }
 }
 ```
-`{{PREFIX}}.job.status` values everywhere: `running | success | failed | partial | skipped_lock`.
-* Inside the body: `RequestSpan.set("{{PREFIX}}.job.items_total", n)`, `…processed`, `…failed`, `…skipped`, `{{PREFIX}}.job.lock=acquired|held_by_other` (and return early with `{{PREFIX}}.job.status=skipped_lock`), gates as `feature_flag.*`, batching as `{{PREFIX}}.batch_size`, and every decision/fallback per 01 §5; outbound calls per 04; publishes per 05 K1.
-* When triggered by an API request (`{{PREFIX}}.job.trigger=api`) the body runs **under the request's trace** (the helper does not call `setNoParent` for api/message triggers) and the request span carries `{{PREFIX}}.job.name` + `{{PREFIX}}.job.run_id` (`RequestSpan.set` before calling `JobRun.run`); when it is `@Async`, the agent keeps the parent and MDC comes from the MDC-copying executor (05 K4).
+`job.status` values everywhere: `running | success | failed | partial | skipped_lock`.
+* Inside the body: `RequestSpan.set("job.items_total", n)`, `…processed`, `…failed`, `…skipped`, `job.lock=acquired|held_by_other` (and return early with `job.status=skipped_lock`), gates as `feature_flag.*`, batching as `batch_size`, and every decision/fallback per 01 §5; outbound calls per 04; publishes per 05 K1.
+* Failures inside a run follow 03 §2.1: the run itself fails (exception leaves `JobRun`) → `error_code` via `SpanOutcome.record` (above); a phase the run skips and continues past → one failure key (`SpanOutcome.nonFatal("reconcile.notify", e)` → `reconcile.notify.failure = "HTTP 500"`); items that fail inside a loop → **counts only** (`items_failed`, `job.status=partial`), never a key per item; a call the run retries → its per-purpose retry span with `retry.count` (04 §4.4).
+* When triggered by an API request (`job.trigger=api`) the body runs **under the request's trace** (the helper does not call `setNoParent` for api/message triggers) and the request span carries `job.name` + `job.run_id` (`RequestSpan.set` before calling `JobRun.run`); when it is `@Async`, the agent keeps the parent and MDC comes from the MDC-copying executor (05 K4).
 * Set the agent's `spring-scheduling` instrumentation **off** everywhere (`-Dotel.instrumentation.spring-scheduling.enabled=false` / `OTEL_INSTRUMENTATION_SPRING_SCHEDULING_ENABLED=false`) — with it on, every `@Scheduled` tick (keep-alives, refreshers) becomes an empty trace, and business jobs would get **two** root spans (the agent's `Class.method` and `JobRun`'s). `JobRun` is the only root for jobs.
 
 ### J2 — Infrastructure refreshers (tokens, config, caches)
 
-One short span per execution **only if** it performs I/O whose failure matters (token endpoint, config server): `JobRun.run("identity-token-refresh", "scheduled", …)` with `{{PREFIX}}.auth.provider`, `{{PREFIX}}.auth.result`, `{{PREFIX}}.auth.token_ttl_s`, `{{PREFIX}}.job.status` (04 §4.2). Failure → ERROR + `{{PREFIX}}.error_code` so "every request is 401 since 03:00" has a cause in `{{TRACE_BACKEND}}`. Keep-alives (`doNothing`), idle-connection monitors: no span.
+One short span per execution **only if** it performs I/O whose failure matters (token endpoint, config server): `JobRun.run("identity-token-refresh", "scheduled", …)` with `auth.provider`, `auth.result`, `auth.token_ttl_s`, `job.status` (04 §4.2). Failure → ERROR + `error_code` so "every request is 401 since 03:00" has a cause in `{{TRACE_BACKEND}}`. Keep-alives (`doNothing`), idle-connection monitors: no span.
 
 ### J3 — Backfills / reconciliations (API- or message-triggered, long-running)
 
@@ -97,26 +99,26 @@ Register at the Spring Batch boundaries, using the ids Batch already has:
 // JobExecutionListener  (extend the existing job listener; keep any APM/analytics publish, add the span)
 public void beforeJob(JobExecution je) {
   Span root = T.spanBuilder(je.getJobInstance().getJobName() + ".run").setSpanKind(SpanKind.INTERNAL).setNoParent()
-     .setAttribute("{{PREFIX}}.job.name", je.getJobInstance().getJobName()).setAttribute("{{PREFIX}}.job.trigger", "cronjob")
-     .setAttribute("{{PREFIX}}.job.execution_id", je.getId()).setAttribute("{{PREFIX}}.job.instance_id", je.getJobInstance().getInstanceId())
-     .setAttribute("{{PREFIX}}.job.run_id", runId).setAttribute("{{PREFIX}}.correlation_id", runId)
-     .setAttribute("{{PREFIX}}.job.params", String.join(",", je.getJobParameters().getParameters().keySet()))     // names only, never values that could be PII
+     .setAttribute("job.name", je.getJobInstance().getJobName()).setAttribute("job.trigger", "cronjob")
+     .setAttribute("job.execution_id", je.getId()).setAttribute("job.instance_id", je.getJobInstance().getInstanceId())
+     .setAttribute("job.run_id", runId).setAttribute("correlation_id", runId)
+     .setAttribute("job.params", String.join(",", je.getJobParameters().getParameters().keySet()))     // names only, never values that could be PII
      .startSpan();
   RUNS.put(je.getId(), new Run(root, root.makeCurrent()));                                          // static ConcurrentHashMap<Long, Run> in the listener — never the persisted ExecutionContext
   MDC.put("correlationId", runId); MDC.put("jobRunId", runId);
 }
 public void afterJob(JobExecution je) {
   Run run = RUNS.remove(je.getId()); Span root = run.span();
-  root.setAttribute("{{PREFIX}}.job.batch_status", je.getStatus().name());                          // raw Spring Batch status
-  root.setAttribute("{{PREFIX}}.job.status", switch (je.getStatus()) { case COMPLETED -> "success"; case FAILED, ABANDONED -> "failed"; case STOPPED, STOPPING -> "partial"; default -> "running"; });
-  root.setAttribute("{{PREFIX}}.job.exit_code", je.getExitStatus().getExitCode());
-  je.getStepExecutions().forEach(se -> { /* totals */ }); root.setAttribute("{{PREFIX}}.job.items_processed", totalWrite); root.setAttribute("{{PREFIX}}.job.items_skipped", totalSkip); root.setAttribute("{{PREFIX}}.job.items_failed", totalRollback);
-  if (je.getStatus().isUnsuccessful()) { root.setStatus(StatusCode.ERROR, je.getExitStatus().getExitCode()); je.getAllFailureExceptions().stream().findFirst().ifPresent(root::recordException); }
+  root.setAttribute("job.batch_status", je.getStatus().name());                          // raw Spring Batch status
+  root.setAttribute("job.status", switch (je.getStatus()) { case COMPLETED -> "success"; case FAILED, ABANDONED -> "failed"; case STOPPED, STOPPING -> "partial"; default -> "running"; });
+  root.setAttribute("job.exit_code", je.getExitStatus().getExitCode());
+  je.getStepExecutions().forEach(se -> { /* totals */ }); root.setAttribute("job.items_processed", totalWrite); root.setAttribute("job.items_skipped", totalSkip); root.setAttribute("job.items_failed", totalRollback);
+  if (je.getStatus().isUnsuccessful()) SpanOutcome.record("{{ERR_PREFIX}}-<module>030", "JOB_FAILED", 500, je.getAllFailureExceptions().stream().findFirst().orElse(null));   // hard failure of the run: code + recordException once + ERROR (03 rule A; root is current, so RequestSpan.root() resolves to it)
   run.scope().close(); root.end(); MDC.clear();                                                      // batch JVM: no request thread to restore
 }
 // StepExecutionListener (extend the existing step listener): one child span per step
-beforeStep: step = T.spanBuilder("step " + se.getStepName()).setAttribute("{{PREFIX}}.job.step", se.getStepName()).setAttribute("{{PREFIX}}.job.step.execution_id", se.getId()).startSpan(); stepScope = step.makeCurrent();
-afterStep:  step.setAttribute("{{PREFIX}}.job.step.status", se.getStatus().name()); step.setAttribute("{{PREFIX}}.job.step.read", se.getReadCount()); …write, skip (read/process/write), rollback, commit counts; ERROR + recordException on failure; stepScope.close(); step.end();
+beforeStep: step = T.spanBuilder("step " + se.getStepName()).setAttribute("job.step", se.getStepName()).setAttribute("job.step.execution_id", se.getId()).startSpan(); stepScope = step.makeCurrent();
+afterStep:  step.setAttribute("job.step.status", se.getStatus().name()); step.setAttribute("job.step.read", se.getReadCount()); …write, skip (read/process/write), rollback, commit counts; ERROR + recordException on failure; stepScope.close(); step.end();
 ```
 * Chunk-oriented steps: no span per chunk or item; `ChunkListener` only to update counts periodically for long steps. Tasklets: the step span is enough.
 * `CommandLineRunner` jobs exit the JVM: ➕ flush the exporter before exit (`OpenTelemetrySdk.getSdkTracerProvider().forceFlush()` when using the SDK; with the agent, allow the shutdown hook to run — do not `System.exit` before `JobExecution` end + a short wait). ⚠ verify the last span reaches `{{TRACE_BACKEND}}`.
@@ -126,15 +128,15 @@ afterStep:  step.setAttribute("{{PREFIX}}.job.step.status", se.getStatus().name(
 ### J5 — Kubernetes CronJob processes (Node / Python / Java) without an agent
 
 * ➕ Minimum (no SDK): generate a run id at start; put it into every log line (`pino`/`winston` child logger), into the chat message text, into every PostgreSQL row the run writes (`run_id` column), and forward it as `{{CORRELATION_HEADER}}` on every HTTP call the run makes — the run becomes searchable in `{{LOG_BACKEND}}` and joinable to the services it called.
-* ➕ Full: OTel SDK for the language (`@opentelemetry/sdk-node` + `@opentelemetry/auto-instrumentations-node`; `opentelemetry-sdk` + `opentelemetry-instrument` for Python; the Java agent for JVM jobs) with `OTEL_EXPORTER_OTLP_ENDPOINT={{COLLECTOR_ENDPOINT}}`, `OTEL_SERVICE_NAME=<service>`, `OTEL_RESOURCE_ATTRIBUTES=service.namespace=<domain>,deployment.environment=<env>`; one root span per run (`{{PREFIX}}.job.*` as in J1) around `main()`, auto-spans for HTTP/pg underneath, `peer.service` mapping for every system it compares (04 §3), and **`sdk.shutdown()` before exit** so the last spans are flushed (a CronJob pod is killed right after `main` returns).
-* Per-system comparison results are decisions: `{{PREFIX}}.check.<system>=match|mismatch|unreachable` (one key per system, low-cardinality) and `{{PREFIX}}.job.items_failed` = number of accounts with any mismatch; the chat message is a *notification* of the span, not a substitute.
+* ➕ Full: OTel SDK for the language (`@opentelemetry/sdk-node` + `@opentelemetry/auto-instrumentations-node`; `opentelemetry-sdk` + `opentelemetry-instrument` for Python; the Java agent for JVM jobs) with `OTEL_EXPORTER_OTLP_ENDPOINT={{COLLECTOR_ENDPOINT}}`, `OTEL_SERVICE_NAME=<service>`, `OTEL_RESOURCE_ATTRIBUTES=service.namespace=<domain>,deployment.environment=<env>`; one root span per run (`job.*` as in J1) around `main()`, auto-spans for HTTP/pg underneath, `peer.service` mapping for every system it compares (04 §3), and **`sdk.shutdown()` before exit** so the last spans are flushed (a CronJob pod is killed right after `main` returns).
+* Per-system comparison results are decisions: `check.<system>=match|mismatch|unreachable` (one key per system, low-cardinality) and `job.items_failed` = number of accounts with any mismatch; the chat message is a *notification* of the span, not a substitute.
 
 ---
 
 ## 4. What must not be done
 
 * No span per tick for keep-alives, idle-connection monitors, `doNothing()`.
-* No span per item/row/account inside a run; no unbounded attribute keys (`{{PREFIX}}.account_<n>`).
+* No span per item/row/account inside a run; no unbounded attribute keys (`account_<n>`).
 * No job parameters that carry PII as attribute values (names only).
 * No new correlation id **inside** a run for each item; the run id is the correlation id for everything the run produces.
 
@@ -143,11 +145,11 @@ afterStep:  step.setAttribute("{{PREFIX}}.job.step.status", se.getStatus().name(
 ## 5. Verification (TraceQL / LogQL)
 
 ```
-{ name =~ ".*\\.run" && kind = internal } | by(span.{{PREFIX}}.job.name, span.{{PREFIX}}.job.status)          -- every job, every outcome
-{ span.{{PREFIX}}.job.name = "monthly-report" } | select(span.{{PREFIX}}.job.execution_id, span.{{PREFIX}}.job.items_processed, span.{{PREFIX}}.job.exit_code)
-{ span.{{PREFIX}}.job.name = "account-reconcile" && span.{{PREFIX}}.job.status = "skipped_lock" }             -- lock contention
-{ span.{{PREFIX}}.job.run_id = "<run>" }                                                                     -- the run and all its CLIENT/JDBC/PRODUCER children
-{ resource.service.name = "<monitoring-service>" && span.{{PREFIX}}.check.erp = "unreachable" }
+{ name =~ ".*\\.run" && kind = internal } | by(span.job.name, span.job.status)          -- every job, every outcome
+{ span.job.name = "monthly-report" } | select(span.job.execution_id, span.job.items_processed, span.job.exit_code)
+{ span.job.name = "account-reconcile" && span.job.status = "skipped_lock" }             -- lock contention
+{ span.job.run_id = "<run>" }                                                                     -- the run and all its CLIENT/JDBC/PRODUCER children
+{ resource.service.name = "<monitoring-service>" && span.check.erp = "unreachable" }
 { name = "identity-token-refresh.run" && status = error }
 LogQL: {k8s_container_name="<monitoring-service>"} | json | correlationId="<run>"      -- label per your log shipper (03 §6)
 ```
@@ -157,9 +159,9 @@ LogQL: {k8s_container_name="<monitoring-service>"} | json | correlationId="<run>
 ## 6. Checklist — one job
 
 - [ ] §2 inventory row: trigger, business vs infrastructure, lock, steps/ids, outputs, error policy, current logs, gates
-- [ ] Business job: `JobRun` root span per run (fresh trace for scheduled/cronjob, child for api/message) with `{{PREFIX}}.job.name/trigger/run_id`, `{{PREFIX}}.correlation_id` = run id in MDC (MDC restored, not cleared, on request threads), status + counts at the end, `SpanOutcome.record` on failure; same body for every trigger
-- [ ] Refreshers: short span with `{{PREFIX}}.auth.*` + status; keep-alives untraced; agent `spring-scheduling` instrumentation off
+- [ ] Business job: `JobRun` root span per run (fresh trace for scheduled/cronjob, child for api/message) with `job.name/trigger/run_id`, `correlation_id` = run id in MDC (MDC restored, not cleared, on request threads), status + counts at the end, `SpanOutcome.record` on failure; same body for every trigger
+- [ ] Refreshers: short span with `auth.*` + status; keep-alives untraced; agent `spring-scheduling` instrumentation off
 - [ ] Spring Batch: job listener root span (`execution_id`, `instance_id`, params names, exit code, totals), step listener child spans with read/write/skip counts; exporter flushed before JVM exit
 - [ ] CronJob process: run id in logs/rows/messages/outbound headers; OTel SDK with `sdk.shutdown()`; per-system check results as attributes
 - [ ] Rows/messages/notifications produced by the run carry the run id; publishes follow 05 K1; outbound calls 04
-- [ ] Verified: one `<job>.run` span per run in `{{TRACE_BACKEND}}` with counts; `{ span.{{PREFIX}}.job.run_id = "<run>" }` shows the children; `{{LOG_BACKEND}}` finds the run's lines by `correlationId`
+- [ ] Verified: one `<job>.run` span per run in `{{TRACE_BACKEND}}` with counts; `{ span.job.run_id = "<run>" }` shows the children; `{{LOG_BACKEND}}` finds the run's lines by `correlationId`
