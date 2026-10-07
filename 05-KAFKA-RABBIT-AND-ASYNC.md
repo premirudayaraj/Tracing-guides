@@ -35,14 +35,15 @@ Estate-wide findings that shaped the rules: **no repo wrote `{{CORRELATION_HEADE
 ```
  producer service                                                   consumer service
  SERVER/INTERNAL span (request or job)                              CONSUMER span  "<topic> process"                (agent)
-   attrs: event_type=ACCOUNT_CREATED  account_number=…   attrs (agent): messaging.system, messaging.destination.name, messaging.destination.partition.id,
+   attrs: fabric.kafka.account.event_type=ACCOUNT_CREATED  account_number=…   attrs (agent): messaging.system, messaging.destination.name, messaging.destination.partition.id,
    └─ PRODUCER span "<topic> publish"       (agent)                          messaging.kafka.offset, messaging.kafka.message.key, messaging.consumer.group.name
-        record headers:  traceparent   ← agent                     attrs (K2): messaging.message.id (payload/header id), messaging.message.conversation_id=<C>,
-                         {{CORRELATION_HEADER}}=<C>   ← K1 interceptor       correlation_id=<C>, correlation_id_generated=false, event_type,
-                         event.id=<msg id>      ← K1                         event_status, consumer.action=processed|skipped|seek_past|dlt|retry, skip_reason
+        record headers:  traceparent   ← agent                     attrs (K2): pbas.kafka.account.message.id (payload/header id), pbas.kafka.account.conversation_id=<C>,
+                         {{CORRELATION_HEADER}}=<C>   ← K1 interceptor       correlation_id=<C>, correlation_id_generated=false, pbas.kafka.account.event_type,
+                         event.id=<msg id>      ← K1                         ….event_status, ….consumer.action=processed|skipped|seek_past|dlt|retry, ….skip_reason
         attrs (agent, on ack): messaging.destination.partition.id, messaging.kafka.offset            └─ CLIENT spans → other services (04), JDBC
-        attrs (K1): messaging.message.id, messaging.message.conversation_id
-   (parent, K1 whenComplete on the captured span) publish.result=acked|failed|exhausted, publish.partition, publish.offset
+        attrs (K1): fabric.kafka.account.message.id, fabric.kafka.account.conversation_id
+   (parent, K1 whenComplete on the captured span) fabric.kafka.account.publish.result=acked|failed|exhausted, ….publish.partition, ….publish.offset
+   (names: <system>.kafka.<subject> — the system the topic feeds on the producer side, the system that sent it on the consumer side; 00 §6)
    (retried send: its own "<topic> publish <purpose> retry" span with retry.count — 04 §4.4; on exhaustion error_code only if the operation fails, else a <topic>.publish.failure key — 03 §2.1)
 ```
 
@@ -51,7 +52,7 @@ Five invariants:
 2. **The correlation id travels as a record header** (`{{CORRELATION_HEADER}}`) *and* stays in the payload where a contract already has it; the consumer **restores** it into MDC and onto the span, generating a new one **only when none arrived** — and says so (`correlation_id_generated=true`).
 3. **The acknowledgement is registered.** A send is not done until the broker answers: the agent puts partition + offset on the PRODUCER span when the ack arrives; the code registers the outcome (`acked | failed | exhausted`) plus partition/offset/message id **on the span it captured before the send** (`whenComplete`), and writes one log line with all four ids. Fire-and-forget is allowed only with that callback; if the parent span may already have ended when the ack arrives (request returned before the broker answered), the log line and the metric are the record — say so in the code comment.
 4. **The receipt is registered.** A consumer registers what it is processing — message id, key, partition, offset, consumer group, event type — *before* doing anything, so a crash mid-way still leaves a searchable span.
-5. **Skipped and ignored are outcomes.** A filtered-out record, a poison message skipped by the error handler, a DLT publish — each is an attribute (`consumer.action`, `skip_reason`) and, when it is a failure, an error on the CONSUMER span.
+5. **Skipped and ignored are outcomes.** A filtered-out record, a poison message skipped by the error handler, a DLT publish — each is an attribute (`<system>.kafka.<subject>.consumer.action`, `….skip_reason`) and, when it is a failure, an error on the CONSUMER span.
 
 ---
 
@@ -83,8 +84,14 @@ public class TracingProducerInterceptor<K, V> implements ProducerInterceptor<K, 
     if (record.headers().lastHeader("traceparent") == null)                                    // the agent injects this on the wire; explicit injection is a no-op without an SDK and harmless with one
       GlobalOpenTelemetry.getPropagators().getTextMapPropagator().inject(Context.current(), record.headers(), (h, k, v) -> h.add(k, v.getBytes(UTF_8)));
     Span caller = Span.current();                                                                // the CALLER's span (request/job/@WithSpan) — the PRODUCER span does not exist yet
-    caller.setAttribute("messaging.message.conversation_id", cid);
-    caller.setAttribute("messaging.message.id", messageIdOf(record));                          // header event.id / payload id
+    String k = TopicNames.keyOf(record.topic());                                                 // "<system>.kafka.<subject>" from a topic → name map kept next to this class (00 §6); null when the topic is not in it
+    if (k != null) {
+      caller.setAttribute(k + ".conversation_id", cid);
+      caller.setAttribute(k + ".message.id", messageIdOf(record));                               // header event.id / payload id
+    } else {
+      // TRACE: generic trace — this code does not know which system or topic it serves; the user has to instruct which name to use.
+      caller.setAttribute("messaging.message.id", messageIdOf(record));
+    }
     return record;
   }
   @Override public void onAcknowledgement(RecordMetadata m, Exception e) {                    // producer I/O thread: NO span is current here and the record is not available — log only
@@ -97,13 +104,15 @@ public class TracingProducerInterceptor<K, V> implements ProducerInterceptor<K, 
 ```java
 public static CompletableFuture<SendResult<K, V>> sendTraced(KafkaTemplate<K, V> t, ProducerRecord<K, V> r, String businessId) {
   Span caller = Span.current();                                                               // captured on the calling thread; may be the request span (ends when the request returns) or a job span
-  caller.setAttribute("publish.result", "pending");                                // default — stays "pending" if the ack never arrives before the span ends: that is a finding, not a bug
+  String k = TopicNames.keyOf(r.topic());                                                     // "<system>.kafka.<subject>" (00 §6)
+  String p = k != null ? k + ".publish" : "publish";                                           // k == null: TRACE: generic trace — this code does not know which system or topic it serves; the user has to instruct which name to use.
+  caller.setAttribute(p + ".result", "pending");                                // default — stays "pending" if the ack never arrives before the span ends: that is a finding, not a bug
   return t.send(r).whenComplete((res, ex) -> {                                                // runs on the producer callback thread; the captured span is still writable until it ends
     String mid = headerOf(r, "event.id");  String cid = headerOf(r, "{{CORRELATION_HEADER}}");
     if (ex == null) { RecordMetadata m = res.getRecordMetadata();
-      caller.setAttribute("publish.result", "acked"); caller.setAttribute("publish.partition", (long) m.partition()); caller.setAttribute("publish.offset", m.offset());
+      caller.setAttribute(p + ".result", "acked"); caller.setAttribute(p + ".partition", (long) m.partition()); caller.setAttribute(p + ".offset", m.offset());
       log.info("kafka acked topic={} partition={} offset={} messageId={} correlationId={} id={}", m.topic(), m.partition(), m.offset(), mid, cid, businessId);   // the record of the ack, agent on or off
-    } else { caller.setAttribute("publish.result", "failed"); caller.setAttribute("error.type", ex.getClass().getName());
+    } else { caller.setAttribute(p + ".result", "failed"); caller.setAttribute("error.type", ex.getClass().getName());
       log.error("kafka send failed topic={} messageId={} correlationId={} id={}", r.topic(), mid, cid, businessId, ex); }               // exception recorded by the exception handler / @Recover (03)
   });
 }
@@ -111,13 +120,13 @@ public static CompletableFuture<SendResult<K, V>> sendTraced(KafkaTemplate<K, V>
 ```
 The agent's PRODUCER span already gets `messaging.destination.partition.id` / `messaging.kafka.offset` from the ack; (b) makes the **outcome** searchable on the request/job span and writes the one log line that carries topic, partition, offset, message id and correlation id together.
 Rules:
-* MUST register the **acknowledgement** through (b): `publish.result`, `publish.partition`, `publish.offset` on the captured span and the ack log line (Kafka), or the publisher-confirm result (RabbitMQ `ConfirmCallback` → `publish.result=acked|nacked` + `messaging.rabbitmq.destination.routing_key`). Where the code already waits (`send(...).get(timeout)`) read `SendResult.getRecordMetadata()` and set the same attributes on `Span.current()`.
-* MUST give every record a **message id**: use the payload's id when the contract has one (an `id` field, a `correlationId`+`eventName` pair), otherwise a header `event.id` (UUID) — and register it as `messaging.message.id` on the PRODUCER span (and the consumer does the same on receipt → the two ends join by id even when the trace is broken).
+* MUST register the **acknowledgement** through (b): `<system>.kafka.<subject>.publish.result`, `….publish.partition`, `….publish.offset` on the captured span and the ack log line (Kafka), or the publisher-confirm result (RabbitMQ `ConfirmCallback` → `<system>.rabbitmq.<subject>.publish.result=acked|nacked` (the routing key is the agent's `messaging.rabbitmq.destination.routing_key`)). Where the code already waits (`send(...).get(timeout)`) read `SendResult.getRecordMetadata()` and set the same attributes on `Span.current()`.
+* MUST give every record a **message id**: use the payload's id when the contract has one (an `id` field, a `correlationId`+`eventName` pair), otherwise a header `event.id` (UUID) — and register it as `<system>.kafka.<subject>.message.id` on the caller's span (and the consumer registers the same id on receipt → the two ends join by id even when the trace is broken).
 * ➕ MUST send with a **key** (the business id: account number, reference id) — a sender that calls `send(topic, payload)` unkeyed loses both searchability (`messaging.kafka.message.key`) and per-entity ordering.
-* Retry (`@Retryable`/`@Recover`): the retry loop is a **per-purpose retry span** (04 §4.4) — `"<topic> publish account-created retry"`, opened in the caller of the `@Retryable` sender, with `retry.count/max/outcome`; each attempt is its own PRODUCER span (agent) underneath, never a span written by code. In `@Recover` register `publish.result=exhausted` and `retry.outcome=exhausted`; then the hard-failure rule (03 §2.1) decides the rest: if the operation fails because of the lost event → the exception handler writes `{{ERR_PREFIX}}-<module>47x` (02 §4 band 47x = messaging); if the request continues → `SpanOutcome.nonFatal("<topic>.publish", "retries exhausted (" + count + ")", e)` → `<topic>.publish.failure`, **no code**. Either way the lost event is searchable (`publish.result=exhausted`); without this, a "retry exhausted" log line is the only trace of it.
-* Fire-and-forget (`send()` without `.get()`/callback) is allowed only through `sendTraced` (b); otherwise the span ends before the broker answers and a failure is invisible. When the request returns before the ack, `publish.result` stays `pending` on that span — the ack log line (with message id + correlation id) is then the record; `{ span.publish.result = "pending" }` tells you where the send is fire-and-forget.
-* On the **caller's span** register what was published before the send: `event_type`, the business id (`account_number` / `reference_id`), `messaging.message.id`; the callback (b) adds the outcome.
-* Library producers (a shared notifications/events library): the library must (a) carry the interceptor, (b) return the ack (`topic, partition, offset, messageId`) or expose a callback so the host can register `publish.result` — a `void sendX(...)` that hides its own failures gives the host nothing; until the library changes, the host registers `publish.result=unknown` and `handled=ignored` (04 §4.3) after the call, and, when the library reports a failure it absorbed, `SpanOutcome.nonFatal("notification.email-send", e)` → `notification.email-send.failure` (03 §2.1).
+* Retry (`@Retryable`/`@Recover`): the retry loop is a **per-purpose retry span** (04 §4.4) — `"<topic> publish account-created retry"`, opened in the caller of the `@Retryable` sender, with `retry.count/max/outcome`; each attempt is its own PRODUCER span (agent) underneath, never a span written by code. In `@Recover` register `<system>.kafka.<subject>.publish.result=exhausted` and `retry.outcome=exhausted`; then the hard-failure rule (03 §2.1) decides the rest: if the operation fails because of the lost event → the exception handler writes `{{ERR_PREFIX}}-<module>47x` (02 §4 band 47x = messaging); if the request continues → `SpanOutcome.nonFatal("<topic>.publish", "retries exhausted (" + count + ")", e)` → `<topic>.publish.failure`, **no code**. Either way the lost event is searchable (`<system>.kafka.<subject>.publish.result=exhausted`); without this, a "retry exhausted" log line is the only trace of it.
+* Fire-and-forget (`send()` without `.get()`/callback) is allowed only through `sendTraced` (b); otherwise the span ends before the broker answers and a failure is invisible. When the request returns before the ack, `<system>.kafka.<subject>.publish.result` stays `pending` on that span — the ack log line (with message id + correlation id) is then the record; `{ span.fabric.kafka.account.publish.result = "pending" }` tells you where the send is fire-and-forget.
+* On the **caller's span** register what was published before the send: `<system>.kafka.<subject>.event_type`, the business id (`account_number` / `reference_id`), `<system>.kafka.<subject>.message.id`; the callback (b) adds the outcome.
+* Library producers (a shared notifications/events library): the library must (a) carry the interceptor, (b) return the ack (`topic, partition, offset, messageId`) or expose a callback so the host can register `<system>.<kafka|rabbitmq>.<subject>.publish.result` — a `void sendX(...)` that hides its own failures gives the host nothing; until the library changes, the host registers `<system>.<kafka|rabbitmq>.<subject>.publish.result=unknown` and `handled=ignored` (04 §4.3) after the call, and, when the library reports a failure it absorbed, `SpanOutcome.nonFatal("notification.email_send", e)` → `notification.email_send.failure` (03 §2.1).
 * Never put payloads, SASL/cloud/schema-registry settings or credentials on spans or in the ack log (an `onSend` that logs the payload is trimmed to ids).
 
 ### K2 — Consumer: receipt first, restore the correlation id, register the message id
@@ -133,12 +142,17 @@ public class TracingRecordInterceptor<K, V> implements RecordInterceptor<K, V> {
     Span s = Span.current();                                                                            // the agent's CONSUMER span "<topic> process"
     s.setAttribute("correlation_id", cid);
     s.setAttribute("correlation_id_generated", h == null && correlationIdInPayload(r) == null);
-    s.setAttribute("messaging.message.conversation_id", cid);
-    s.setAttribute("messaging.message.id", messageIdOf(r));                                             // header event.id or payload id
-    s.setAttribute("messaging.kafka.offset", r.offset()); s.setAttribute("messaging.destination.partition.id", String.valueOf(r.partition()));   // agent sets these too — harmless, and present when the agent is off
-    s.setAttribute("messaging.kafka.message.key", String.valueOf(r.key()));
-    s.setAttribute("messaging.consumer.group.name", c.groupMetadata().groupId()); s.setAttribute("messaging.client.id", clientIdOf(c));
-    s.setAttribute("consumer.action", "received");                                           // default; the listener overwrites (processed | skipped | retry | dlt | rethrown)
+    String k = TopicNames.keyOf(r.topic());                                                             // "<system>.kafka.<subject>": the system that sent it + the topic's short name (00 §6); null when the topic is not in the map
+    if (k != null) {
+      s.setAttribute(k + ".conversation_id", cid);
+      s.setAttribute(k + ".message.id", messageIdOf(r));                                               // header event.id or payload id
+      s.setAttribute(k + ".consumer.action", "received");                                              // default; the listener overwrites (processed | skipped | retry | dlt | rethrown)
+    } else {
+      // TRACE: generic trace — this code does not know which system or topic it serves; the user has to instruct which name to use.
+      s.setAttribute("messaging.message.id", messageIdOf(r));
+      s.setAttribute("consumer.action", "received");
+    }
+    // offset, partition, key, consumer group, client id: the agent's own messaging.* keys on this CONSUMER span — not written again here (00 §6.1)
     log.info("receipt topic={} partition={} offset={} key={} group={} messageId={} correlationId={}", …);  // the receipt line, without the payload
     return r;
   }
@@ -147,16 +161,17 @@ public class TracingRecordInterceptor<K, V> implements RecordInterceptor<K, V> {
 ```
 Then the **listener body** registers only business facts and decisions:
 ```java
-s.setAttribute("event_type", msg.getType()); s.setAttribute("event_status", msg.getEventStatus()); s.setAttribute("event_source", src);
-s.setAttribute("account_number", first(msg.accountNumbers())); s.setAttribute("master_data_id", msg.getMasterId());
-if (!isBilling(msg)) { s.setAttribute("consumer.action", "skipped"); s.setAttribute("skip_reason", "NOT_BILLING_ACCOUNT"); return; }   // every early return
+String k = "dih.kafka.account";                                                               // this listener knows its topic: the system that sent it + the topic's short name (00 §6)
+s.setAttribute(k + ".event_type", msg.getType()); s.setAttribute(k + ".event_status", msg.getEventStatus()); s.setAttribute(k + ".event_source", src);
+s.setAttribute("account_number", first(msg.accountNumbers())); s.setAttribute("master_data_id", msg.getMasterId());   // business ids keep their common names (01 §7)
+if (!isBilling(msg)) { s.setAttribute(k + ".consumer.action", "skipped"); s.setAttribute(k + ".skip_reason", "NOT_BILLING_ACCOUNT"); return; }   // every early return
 s.setAttribute("audit_id", auditRow.getId());                                                // the row the consumer wrote
-s.setAttribute("route", "completeStagedWorkflow");                                            // routing by event type
+s.setAttribute(k + ".route", "completeStagedWorkflow");                                            // routing by event type
 ```
 Rules:
 * MUST NOT generate a fresh UUID per message when a header/payload correlation id exists; MUST flag generation.
 * MUST register the receipt (ids above) **before** parsing/processing — the "Start processing event, key/offset/partition/group/clientId" receipt line is the model; a listener that logs only the message `id` is not enough.
-* MUST register every filter/early-return as `consumer.action=skipped` + `skip_reason=<enum>` (ignore reasons, null payload, source mismatch in a `RecordFilterStrategy`). Without this they are invisible successes (where an `EVENT_IGNORED{reason}` metric exists — keep it; the span attribute is what joins it to the producer).
+* MUST register every filter/early-return as `<system>.kafka.<subject>.consumer.action=skipped` + `….skip_reason=<enum>` (ignore reasons, null payload, source mismatch in a `RecordFilterStrategy`). Without this they are invisible successes (where an `EVENT_IGNORED{reason}` metric exists — keep it; the span attribute is what joins it to the producer).
 * Gates: a listener that is `autoStartup=false` behind a feature flag registers nothing (it does not run). Register the flag where the container is started/stopped (the flag listener / `KafkaListenerEndpointRegistry` call): one INFO line `listener=<id> topic=<t> flag=<key> state=started|stopped` and `feature_flag.key/result.variant` (00 §6) on the job/request span that toggled it; alert on "no consumer spans for topic X in N minutes".
 * Batch listeners: one CONSUMER span per batch (agent, with links) + `messaging.batch.message_count`, `job.items_processed/failed`; no span per record.
 * Downstream calls from the listener get the correlation id from MDC through the existing client interceptors (04) — K2 is what makes that header correct.
@@ -167,16 +182,17 @@ The container's error handler (`CommonErrorHandler.handleOne`, `DefaultErrorHand
 ```java
 @KafkaListener(...) public void receive(ConsumerRecord<String, AccountMessage> r) {
   Span s = Span.current();                                             // the CONSUMER span
-  s.setAttribute("consumer.delivery_attempt", deliveriesSoFar(r));   // redeliveries before this one (retry-topic attempt header / DefaultErrorHandler delivery attempt) — the consumer's own "retry count"
+  String k = "dih.kafka.account";                                      // the system that sent it + the topic's short name (00 §6)
+  s.setAttribute(k + ".delivery_attempt", deliveriesSoFar(r));   // redeliveries before this one (retry-topic attempt header / DefaultErrorHandler delivery attempt) — the consumer's own "retry count"
   try (Scope root = RequestSpan.open(s)) {                             // 01 §6: makes the CONSUMER span the root for RequestSpan.set / SpanOutcome.nonFatal inside process()
-    process(r); s.setAttribute("consumer.action", "processed"); }
-  catch (NonRetryableException e) { s.setAttribute("consumer.action", "skipped"); SpanOutcome.record("{{ERR_PREFIX}}-<module>47x", "EVENT_INVALID", 500, e); throw e; }   // 03: recordException once, ERROR, error_code — the listener GAVE UP on the record = hard failure
-  catch (Exception e)             { s.setAttribute("consumer.action", willRetry(e) ? "retry" : "dlt"); SpanOutcome.record("{{ERR_PREFIX}}-<module>47x", "EVENT_PROCESSING_FAILED", 500, e); throw e; }
+    process(r); s.setAttribute(k + ".consumer.action", "processed"); }
+  catch (NonRetryableException e) { s.setAttribute(k + ".consumer.action", "skipped"); SpanOutcome.record("{{ERR_PREFIX}}-<module>47x", "EVENT_INVALID", 500, e); throw e; }   // 03: recordException once, ERROR, error_code — the listener GAVE UP on the record = hard failure
+  catch (Exception e)             { s.setAttribute(k + ".consumer.action", willRetry(e) ? "retry" : "dlt"); SpanOutcome.record("{{ERR_PREFIX}}-<module>47x", "EVENT_PROCESSING_FAILED", 500, e); throw e; }
 }
 // a failure the listener CATCHES AND CONTINUES from (an optional enrichment call, a notification) is not a hard failure of the record: SpanOutcome.nonFatal("<dependency>.<action>", e) → <dependency>.<action>.failure, no code (03 §2.1)
 // error handler (handleOne etc.): log topic/partition/offset/key/message id + exception, decide skip/seek/retry — no span code
 ```
-* Values of `consumer.action`: `processed | skipped (filtered or poison, handler returns true) | retry (backoff / retry topic) | dlt (published to -DLT) | rethrown`. Deserialization failures (`seek past offset+1`) never reach the listener and have **no CONSUMER span** — they are a log line (topic/partition/offset) + a metric (`kafka_deserialization_failures_total{topic}`), not an attribute.
+* Values of `<system>.kafka.<subject>.consumer.action`: `processed | skipped (filtered or poison, handler returns true) | retry (backoff / retry topic) | dlt (published to -DLT) | rethrown`. Deserialization failures (`seek past offset+1`) never reach the listener and have **no CONSUMER span** — they are a log line (topic/partition/offset) + a metric (`kafka_deserialization_failures_total{topic}`), not an attribute.
 * A DLT/retry-topic publish is a PRODUCER span child of the failing CONSUMER span (K1 carries the correlation id and message id onto the DLT record automatically) → the trace shows where the message went.
 * Never log the record value in the handler: topic/partition/offset/key/message id + exception only.
 
@@ -193,8 +209,8 @@ One CONSUMER span (or `@WithSpan("Backfill.run")` root) + counts (`batch_size`, 
 ### K6 — RabbitMQ specifics
 
 * Semantics: `messaging.system=rabbitmq`, `messaging.destination.name={exchange}:{routing key}` (producer) / `{exchange}:{routing key}:{queue}` (consumer), `messaging.rabbitmq.destination.routing_key`, `messaging.rabbitmq.message.delivery_tag`; operation names `publish`/`process`.
-* Check whether a deployment ConfigMap disables the agent's `spring-rabbit` instrumentation (`OTEL_INSTRUMENTATION_SPRING_RABBIT_ENABLED=false`); the lower-level `rabbitmq` (amqp-client) instrumentation may still create spans ⚠ — check one `{ span.messaging.system = "rabbitmq" }` in `{{TRACE_BACKEND}}`. If nothing appears: ➕ enable `spring-rabbit`, or apply K1/K2 through a `MessagePostProcessor` (publish: `{{CORRELATION_HEADER}}` + `message_id` properties; `ConfirmCallback` → `publish.result`) and a `@RabbitListener` advice (`MessageProperties.getHeader("{{CORRELATION_HEADER}}")`, `getMessageId()`, `getDeliveryTag()`).
-* `StreamBridge` producers: keep the existing `x-correlation-id` header but source it from MDC (K1), not a new UUID; register `messageId` from `MessageHeaders` as `messaging.message.id`; Spring Cloud Stream `send` returns a boolean, so the outcome is `publish.result=accepted|rejected` (no broker offset).
+* Check whether a deployment ConfigMap disables the agent's `spring-rabbit` instrumentation (`OTEL_INSTRUMENTATION_SPRING_RABBIT_ENABLED=false`); the lower-level `rabbitmq` (amqp-client) instrumentation may still create spans ⚠ — check one `{ span.messaging.system = "rabbitmq" }` in `{{TRACE_BACKEND}}`. If nothing appears: ➕ enable `spring-rabbit`, or apply K1/K2 through a `MessagePostProcessor` (publish: `{{CORRELATION_HEADER}}` + `message_id` properties; `ConfirmCallback` → `<system>.rabbitmq.<subject>.publish.result`) and a `@RabbitListener` advice (`MessageProperties.getHeader("{{CORRELATION_HEADER}}")`, `getMessageId()`, `getDeliveryTag()`).
+* `StreamBridge` producers: keep the existing `x-correlation-id` header but source it from MDC (K1), not a new UUID; register `messageId` from `MessageHeaders` as `<system>.kafka.<subject>.message.id`; Spring Cloud Stream `send` returns a boolean, so the outcome is `<system>.kafka.<subject>.publish.result=accepted|rejected` (no broker offset).
 
 ### K7 — Kafka clients outside the JVM (Node `kafkajs`, Python)
 
@@ -223,13 +239,13 @@ Same attributes and headers; OTel Node SDK + `@opentelemetry/instrumentation-kaf
 ## 5. Verification (TraceQL)
 
 ```
-{ span.publish.result != nil } | by(span.event_type, span.publish.result)     -- acked / failed / exhausted / pending per event type (on the caller's span)
-{ span.publish.result = "exhausted" } | select(span.reference_id, span.error_key)
-{ kind = consumer } | by(span.messaging.destination.name, span.consumer.action, span.skip_reason)
+{ span.fabric.kafka.account.publish.result != nil } | by(span.fabric.kafka.account.event_type, span.fabric.kafka.account.publish.result)   -- acked / failed / exhausted / pending per event type (on the caller's span)
+{ span.fabric.kafka.account.publish.result = "exhausted" } | select(span.reference_id, span.error_key)
+{ kind = consumer && span.dih.kafka.account.consumer.action != nil } | by(span.dih.kafka.account.consumer.action, span.dih.kafka.account.skip_reason)
 { kind = consumer && span.correlation_id_generated = true } | by(span.messaging.destination.name)   -- producers still sending no header
-{ span.messaging.message.id = "<id>" }                                                                     -- producer + consumer spans of one message, even if the trace broke
+{ span.fabric.kafka.account.message.id = "<id>" || span.pbas.kafka.account.message.id = "<id>" }   -- producer side + consumer side of one message, even if the trace broke
 { span.correlation_id = "<C>" }                                                                  -- request → publish → process → downstream, one result
-{ kind = consumer && status = error } | by(span.error_code, span.consumer.action)
+{ kind = consumer && status = error } | by(span.error_code, span.dih.kafka.account.consumer.action)
 { kind = consumer } >> { span.peer.service = "<dependency>" && status = error }
 { span.messaging.system = "rabbitmq" }                                                                     -- must not be empty if Rabbit is in use (K6)
 ```
@@ -247,10 +263,10 @@ Same attributes and headers; OTel Node SDK + `@opentelemetry/instrumentation-kaf
 ## 7. Checklist — one producer, one consumer
 
 - [ ] §2 inventory rows exist for every send and every listener (system, topic, key, headers, message id, correlation id, sync/async, retry, ack read?, filters, error handler, gates)
-- [ ] Producer: interceptor on every producer factory adds `{{CORRELATION_HEADER}}` (+ `event.id`, explicit `traceparent`), `messaging.message.id`, `messaging.message.conversation_id` on the caller's span; record has a key and a message id; every send goes through `sendTraced` (or reads `SendResult`) so the **ack is registered** (`publish.result/partition/offset` + the ack log line); a retried send has its per-purpose retry span with `retry.count` (04 §4.4); `@Recover` → `publish.result=exhausted` + code (hard failure) or `<topic>.publish.failure` via `SpanOutcome.nonFatal` (request continues); caller's span carries `event_type` + business id
-- [ ] Consumer: record interceptor on every factory restores MDC + `correlation_id` (generates only if absent, flags it), registers receipt ids (`message.id`, offset, partition, key, group, client id); listener registers event type/status/source, business ids, every skip as `consumer.action=skipped` + `skip_reason`, rows written, route taken
-- [ ] Listener `try/catch` (not the error handler) records skipped/retry/DLT on the CONSUMER span via `SpanOutcome.record` + `consumer.action` (a hard failure of the record); non-fatal errors inside the listener (caught, processing carried on) get a `<dependency>.<action>.failure` key via `SpanOutcome.nonFatal`, no code; error handler logs ids only; deserialization failures → log + metric; payload never logged
+- [ ] Producer: interceptor on every producer factory adds `{{CORRELATION_HEADER}}` (+ `event.id`, explicit `traceparent`), `<system>.kafka.<subject>.message.id`, `….conversation_id` on the caller's span (generic key + the TRACE comment only where nothing names the topic, 00 §6); record has a key and a message id; every send goes through `sendTraced` (or reads `SendResult`) so the **ack is registered** (`<system>.kafka.<subject>.publish.result/partition/offset` + the ack log line); a retried send has its per-purpose retry span with `retry.count` (04 §4.4); `@Recover` → `….publish.result=exhausted` + code (hard failure) or `<topic>.publish.failure` via `SpanOutcome.nonFatal` (request continues); caller's span carries `….event_type` + business id
+- [ ] Consumer: record interceptor on every factory restores MDC + `correlation_id` (generates only if absent, flags it), registers `<system>.kafka.<subject>.message.id` (offset, partition, key, group and client id are the agent's); listener registers event type/status/source, business ids, every skip as `….consumer.action=skipped` + `….skip_reason`, rows written, route taken
+- [ ] Listener `try/catch` (not the error handler) records skipped/retry/DLT on the CONSUMER span via `SpanOutcome.record` + `….consumer.action` (a hard failure of the record); non-fatal errors inside the listener (caught, processing carried on) get a `<dependency>.<action>.failure` key via `SpanOutcome.nonFatal`, no code; error handler logs ids only; deserialization failures → log + metric; payload never logged
 - [ ] RabbitMQ paths covered (K6) and verified to produce spans
 - [ ] Thread hops on MDC-aware executors; no common-pool `runAsync`; no request-scoped beans off-thread
 - [ ] Deferred work stores W3C context + correlation id with the row and restores them on dispatch
-- [ ] Verified: `{ span.messaging.message.id = "<id>" }` returns the producer and consumer spans; `{ span.correlation_id = "<C>" }` shows request → publish → process in one trace with the agent on; consumer log line carries the same correlation id with the agent off
+- [ ] Verified: the message id query of §5 returns the producer and consumer spans; `{ span.correlation_id = "<C>" }` shows request → publish → process in one trace with the agent on; consumer log line carries the same correlation id with the agent off

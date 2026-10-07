@@ -137,7 +137,7 @@ Section headings are fixed strings; a section with nothing to say still appears 
 5. Outbound handovers
    | Dependency (peer.service) | Purpose(s) | Auth step | Request fields registered | Response fields registered | Outcome facets (<dep>.outcome values seen) | Retry span (name, max) |
 6. Messaging
-   | Direction | Topic / exchange | Key | Message id source | Correlation id (header / payload) | Ack / receipt attributes | Skip reasons / consumer.action values | Error handling (retry topic, DLT, seek-past) |
+   | Direction | Topic / exchange | Key | Message id source | Correlation id (header / payload) | Ack / receipt attributes | Skip reasons / `<system>.kafka.<subject>.consumer.action` values | Error handling (retry topic, DLT, seek-past) |
 7. Jobs
    | Job | Trigger | Root span name | Run id → correlation id | Counts registered | Status values | Lock |
 8. Error codes and calls the service carries on past

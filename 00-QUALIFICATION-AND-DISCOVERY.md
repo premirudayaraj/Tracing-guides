@@ -144,18 +144,21 @@ The rules in 01–07 are written for case 1 (agent on) and stay harmless when th
 ## 6. Naming — standard names first, then plain meaningful names
 
 Use the OpenTelemetry semantic-convention attribute when one exists. For everything the standard does not cover, write a plain, meaningful name — **no company prefix**:
-* lower-case; dots separate groups, underscores separate words inside a group (`authz.decision`, `job.run_id`, `correlation_id`); dependency names keep their own hyphens, exactly as in `peer.service` (`support-case.create.failure`);
+* lower-case; dots separate groups, underscores separate words inside a group (`authz.decision`, `job.run_id`, `correlation_id`); a hyphen in a dependency name becomes `_` in the key (the `peer.service` value `support-case` is the key group `support_case`; §6.1) (`support_case.create.failure`);
 * the name says what the value is when read on its own in a trace (`grants.accounts_count`, not `count`);
 * **never start with an OpenTelemetry namespace.** The first group must not be a namespace of the attribute registry (https://opentelemetry.io/docs/specs/semconv/registry/attributes/) — the ones most likely to be hit: `http`, `url`, `server`, `client`, `network`, `db`, `messaging`, `rpc`, `user`, `enduser`, `session`, `error`, `exception`, `event`, `code`, `service`, `peer`, `source`, `destination`, `app`, `feature_flag`, `log`, `file`, `process`, `thread`, `host`, `container`, `k8s`, `cloud`, `deployment`, `telemetry`, `otel`, `test`. OpenTelemetry's own naming guidance says not to reuse its namespaces for custom attributes, because a later release or an instrumentation library can define the same key with another meaning. That is why the guides use `grants.accounts_count` (not `user.accounts_count`) and `event_type` (not `event.type`). A single-group name such as `error_code` or `failure_count` is not inside a namespace (`error_code` is not `error.*`) and is fine;
 * only when the natural name would start with a namespace and no better word exists — typically a dependency whose name *is* a namespace, e.g. a service literally called `db` or `messaging` — put `{{PREFIX}}.` (README §0) in front of **that key only**: `{{PREFIX}}.db.write.failure`. That is the only use of the company prefix.
+* **name the key after what it is about.** A key that describes one call, one message, one topic or one exchange starts with the system and the thing, never with a generic word: `<system>.<action>.<fact>` for an HTTP call (`pbas.company_account_search.page_size`, `pbas.company_account_search.response.correlation_id`), `<system>.kafka.<subject>.<fact>` or `<system>.rabbitmq.<subject>.<fact>` for a message (`dih.kafka.userdetails.message.id`, `fabric.kafka.account.publish.result`, `dih.kafka.account.consumer.action`). `<system>` is the system on the other end — the `peer.service` name for a call, the system the topic feeds for a publish, the system that sent it for a consume; `<subject>` is the short business name of the topic, exchange or action, without environment suffixes (`account`, not `equinix.account.prod`). The key goes through `AttrName.of(...)` like every key that starts with a dependency name. Why: a generic key (`messaging.message.id`, `publish.result`, `consumer.action`, `call.page_size`) on a request span does not say which Kafka or which call it belongs to, and the second publish or call in the same request overwrites the first.
+* **keys common to every service keep their common name**: the request's identity and caller (`correlation_id`, `correlation_id_generated`, `caller.*`, `user.*`, `session.id`, `org_id`, `channel_type`, `actor.*`), authentication and authorization (`authn.*`, `authz.*`, `grants.*`, `auth.*`), the request's outcome summary (`error_code`, `error_key`, `error.type`, `failure_count`, `upstream.*`, `handled`), business ids (01 §7), job keys on the job's own span (`job.*`), and every key the OpenTelemetry agent writes itself (`service.name`, `http.*`, `db.*`, and `messaging.*` on its own PRODUCER and CONSUMER spans).
+* **shared helper code:** when the line that writes the key is shared by several systems or topics (one Kafka sender for every topic, a record interceptor on every listener, one WebClient filter for every client), build the name from what the helper receives — the topic, exchange or client it is given — through a small map kept next to the helper (`topic → <system>.kafka.<subject>`). When nothing the helper receives names the target, keep the generic key and put this comment on the line: `// TRACE: generic trace — this code does not know which system or topic it serves; the user has to instruct which name to use.` List every such line in the run report.
 
 When the prefix is added, and by whom:
 
 | Kind of key | Example | Prefix? | Who decides |
 |---|---|---|---|
 | Standard OpenTelemetry key | `http.route`, `user.name`, `error.type`, `messaging.message.id` | never — it *is* the standard | the key exists in the registry |
-| Our fixed keys (the vocabulary of 01 §7) | `correlation_id`, `authz.decision`, `grants.accounts_count`, `event_type`, `job.run_id` | no — every fixed key in 01 §7 was checked against the registry | the guides |
-| Keys whose first group is a **dependency, topic or job name** | `<dependency>.<action>.failure`, `<dependency>.outcome`, `<dependency>.version` (keys like `check.<system>` or `call.<purpose>.*` start with a fixed word and are safe) | **only if** that name is a namespace: `support-case.create.failure` → no prefix; `db.write.failure` → `{{PREFIX}}.db.write.failure` | the `AttrName.of(...)` helper (01 §6, Node: `attrName(...)` in 07 N4) — the code decides at runtime, the assistant never has to remember |
+| Our fixed keys (the vocabulary of 01 §7) | `correlation_id`, `authz.decision`, `grants.accounts_count`, `account_number`, `job.run_id` | no — every fixed key in 01 §7 was checked against the registry | the guides |
+| Keys whose first group is a **dependency, topic or job name** | `<dependency>.<action>.failure`, `<dependency>.outcome`, `<dependency>.version`, `<system>.<action>.<fact>`, `<system>.kafka.<subject>.<fact>` (keys like `check.<system>` or `call.<purpose>.*` start with a fixed word and are safe) | **only if** that name is a namespace: `support_case.create.failure` → no prefix; `db.write.failure` → `{{PREFIX}}.db.write.failure` | the `AttrName.of(...)` helper (01 §6, Node: `attrName(...)` in 07 N4) — the code decides at runtime, the assistant never has to remember |
 | A new key the assistant invents for this service | `invoice.download_format` | no, unless its first group is a namespace — then rename it first; prefix only if no better word exists | the check below, run before the run finishes |
 
 The namespace list (the registry's namespaces, September 2026 — refresh from the registry link above when it changes): android, app, artifact, aspnetcore, aws, azure, browser, cassandra, cicd, client, cloud, cloudevents, cloudfoundry, code, container, cpu, cpython, db, deployment, destination, device, disk, dns, dotnet, elasticsearch, enduser, error, event, exception, faas, feature_flag, file, gcp, gen_ai, geo, go, graphql, heroku, host, http, hw, ios, jsonrpc, jvm, k8s, linux, log, mainframe, mcp, messaging, network, nfs, nodejs, oci, onc_rpc, openai, openshift, opentracing, oracle_cloud, oracledb, os, otel, peer, pprof, process, profile, rpc, security_rule, server, service, session, signalr, source, system, telemetry, test, thread, tls, url, user, user_agent, v8js, vcs, webengine, zos.
@@ -172,12 +175,69 @@ The full vocabulary is in 01 §7; the rule of thumb:
 | Concept | Use | Not |
 |---|---|---|
 | HTTP method / route / status | `http.request.method`, `http.route`, `http.response.status_code` (agent) | `status` |
-| Dependency name | `peer.service` (agent mapping) | `upstream_host` |
+| Dependency name | `peer.service` (agent mapping; deprecated in the conventions in favour of `service.peer.name`, query what the deployed agent writes) | `upstream_host` |
+| Header of an outbound call | `http.request.header.<lower-case name>` on the CLIENT span (agent config, never credential headers) | `crh-req-header`, `crh.req.headers` |
 | Caller identity (person) | `user.name` (masked login), `user.id` (user key), `user.roles`, `enduser.id` only when the raw id is allowed | `user` |
 | Calling **service** (inbound) | `caller.service` (the caller's `service.name`; `external`/`unknown` when none) + `caller.source` (how it was obtained: mesh cert, gateway header, api-key registry, jwt client claim, self-declared header) — no standard key exists for this; `client.address` stays the agent's IP (01 §3.1) | `caller_ip`, `source_app`, a hostname |
 | Failure type | `error.type` (exception class or domain code) + `error_code` (`{{ERR_PREFIX}}-…`) on hard failures; `<dependency>.<action>.failure` (short reason) + `failure_count` on non-fatal ones; `retry.count` on per-purpose retry spans | `exception`, `handled_error_code`, `retry.attempt_<n>` |
 | Feature flag | `feature_flag.key`, `feature_flag.result.variant`, `feature_flag.provider.name` (one flag per span) or `flag.<key>=<variant>` when several flags decide one request | `<vendor>_flag` |
-| Message identity | `messaging.message.id`, `messaging.message.conversation_id` (= correlation id), `messaging.kafka.offset`, `messaging.destination.partition.id`, `messaging.kafka.message.key`, `messaging.consumer.group.name`, `messaging.rabbitmq.destination.routing_key`, `messaging.rabbitmq.message.delivery_tag` | `offset` |
+| Message identity | our code: `<system>.kafka.<subject>.message.id` (`dih.kafka.userdetails.message.id`) on the caller's span and on the consumer's span; the agent: `messaging.message.id`, `messaging.kafka.offset`, `messaging.destination.partition.id`, `messaging.kafka.message.key`, `messaging.consumer.group.name`, `messaging.rabbitmq.destination.routing_key` on its own PRODUCER/CONSUMER spans — never written again by our code | `messaging.message.id` written by our code, `offset` |
 | Session | `session.id` (browser / `{{SESSION_HEADER}}`) | `session` |
 | Code location of a manual span | `code.function.name` (agent sets it for `@WithSpan`) | — |
-| Our business ids and decisions | `correlation_id`, `account_number`, `authz.*`, `job.*`, `consumer.action`, `publish.result` … | ad-hoc names |
+| Our business ids and decisions | common: `correlation_id`, `account_number`, `authz.*`, `job.*`; facts about one call or message carry its name: `pbas.company_account_search.page_size`, `fabric.kafka.account.publish.result`, `dih.kafka.account.consumer.action` | ad-hoc names; `publish.result`, `consumer.action`, `call.page_size` without the system |
+
+### 6.1 OpenTelemetry key rules (mandatory, checked by `tools/trace-coverage.py`)
+
+Sources: naming https://opentelemetry.io/docs/specs/semconv/general/naming/ , errors https://opentelemetry.io/docs/specs/semconv/general/recording-errors/ , HTTP spans https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+
+* **Characters:** lower-case `a-z`, digits, `.` between namespace groups, `_` between words inside a group. No hyphen, no capital, no space; starts with a letter, ends with a letter or digit, never two delimiters in a row. Pattern: `^[a-z][a-z0-9]*([._][a-z0-9]+)*$`. A hyphen in a dependency name becomes `_` in the key (`AttrName.of` does it).
+* **Short, but whole words:** the words the conventions use (`request`, `response`, `status_code`, `count`, `id`, `duration`), no abbreviations; read alone in a trace the key still says what the value is.
+* **Standard key first, our key only for what the standard does not name.** The transport facts of a call are already on the agent's CLIENT span and are never copied under another name: `http.request.method`, `url.full`, `server.address`, `http.response.status_code`, `http.request.resend_count`, `error.type`, `messaging.*`, `db.*`. Our keys carry the business facts: purpose, ids, counts, the decision taken — named after the call or message they describe (§6): `pbas.company_account_search.ids_count`, not `call.ids_count`.
+* **Headers:** a header of an outbound call is `http.request.header.<lower-case header name>` (reply: `http.response.header.<name>`) on the CLIENT span, written by the agent when the header is listed in `otel.instrumentation.http.client.capture-request-headers` / `capture-response-headers`. Authorization, api-key, cookie and token headers are never listed.
+
+| Functionality | Key | Rule |
+|---|---|---|
+| CRH call made externally: a request header sent | `http.request.header.x-correlation-id` on the CLIENT span (agent config) | standard key; not `crh-req-header` |
+| CRH call: why it was made | the key prefix `crh.billing_account_get.` on the caller's span; `call.purpose` = `crh.billing_account_get` only on a span that exists for this one call (04 §4.4 retry span) | §6, 04 §4.1 |
+| CRH call: which account | `crh.billing_account_get.id` | 04 §4.1 |
+| CRH call: HTTP status | `http.response.status_code` on the CLIENT span; `upstream.status` on the root when it fails the request | standard key / 03 |
+| CRH call: outcome for this request | `crh.outcome` = `ok` / `mapped` / `fallback` | 04 §4.3 |
+| Cache lookup before the CRH call | `crh.cache.hit` = `true` / `false` | decision key |
+| DIH address-fields call: fields returned | `dih.address_fields.response.count` | 04 §4.3 |
+| Kafka publish result | `fabric.kafka.account.publish.result` = `acked` / `failed` / `exhausted` and `fabric.kafka.account.message.id` (our code, on the caller's span); `messaging.kafka.offset` stays the agent's, on its PRODUCER span | 05 |
+
+* **Where a key goes:** facts about one call on the span of that call's caller (or its own span); only the outcome summary goes on the request's root span. A span keeps at most 128 attributes by default (`OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`) and drops the rest without warning.
+* **Errors:** a failure that ends the operation sets span status `Error` plus `error.type` (exception class or short code) and records the exception once. An error that is retried or handled so the operation still completes does **not** set status `Error`: it is written as the failure key of 03 (`<dependency>.<action>.failure`) and the program carries on. An HTTP 4xx is `Error` on the CLIENT span, never on the SERVER span.
+* **`peer.service`** is deprecated in the conventions in favour of `service.peer.name`. Query whichever the deployed agent writes, checked on one CLIENT span before a query or dashboard is written.
+* Never the `otel.*` namespace; never a new key inside a convention namespace (§6).
+
+---
+
+## 7. Coverage: every function, every call, every decision (mandatory)
+
+Roles (§3) decide which guides apply. They never allow a class or a function to be left out. A run that leaves an outbound call or a request-path decision without its keys is not finished: "deferred", "left as a gap" or "outside the scope of this pass" are not valid outcomes in the report.
+
+### 7.1 What must be covered
+
+| Item | Where | Keys it must leave |
+|---|---|---|
+| **Outbound call**: HTTP, gRPC, message publish, token or identity call, file store, e-mail or notification, a cache or database read that decides the answer | every function that performs it, in whatever class (client, service, listener, job) | **before** the call: `call.purpose` and the decisive request fields (04 §4.1); **after**: response id / count / status and `<dependency>.outcome` (04 §4.3); **on failure**: status `Error` + `error.type` when the failure ends the operation, with `upstream.name` / `upstream.status` / `upstream.code` / `handled` on the root; `<dependency>.<action>.failure` when the program carries on (03) |
+| **Decision**: `if` / `switch` / ternary, `orElse` / `filter`, a feature flag, a fallback, an early return, a catch that carries on, a validation result, a retry | every function that chooses between outcomes for the request or the job run | the decision and the input that drove it (01 §7: `<area>.decision`, `fallback`, `feature_flag.*`, a count or an id), plus the failure key when the branch swallows an error |
+
+Two things do not count as coverage: the agent's automatic CLIENT span on its own (URL, status and exception, none of the business fields above), and a key set on a path this call does not pass through.
+
+A branch needs no key only when it cannot change what the request returns, where it goes or what it stores: a null or format guard on an internal value, a log statement, a pure mapping. Those functions are still listed in the report (§7.3), never skipped silently.
+
+### 7.2 Work list, before writing code
+
+```sh
+python3 {{GUIDES_DIR}}tools/trace-coverage.py <project> > /tmp/trace-coverage-before.txt
+```
+
+It prints one `CALL` line per outbound call site (keys found before / after / on failure in the function and its callers, and what is `MISSING`), one `DECISION` line per function that branches but writes no key, one `BADKEY` line per key that breaks §6.1, and a `SUMMARY`. Work through every line, one class at a time.
+
+### 7.3 Done means
+
+* the tool, run again, prints `missing 0` and `badkeys 0`;
+* every `DECISION` line still printed is listed in the report with the reason it needs no key (§7.1);
+* the report has one row per outbound call: function, dependency, keys before / after / on failure.

@@ -25,7 +25,7 @@
 | Sink | Carries today | ➕ Should carry | Joined by |
 |---|---|---|---|
 | **Response body** | `errorCode`, `errorMessage`, `details`, `additionalInfo[]`, `correlationId`; real HTTP status (02 §7) | `{{CORRELATION_HEADER}}` response header on every response (01 §3) | `correlationId` |
-| **Span** | `http.response.status_code`, status (5xx), `error.type`, `exception.*` (agent), `http.request.header.<correlation header>` (captured) | `error_code` (hard failures only, §2.1), `error_key`, `<dependency>.<action>.failure` + `failure_count` (non-fatal errors, §2.1), `retry.count` (on per-purpose retry spans), `correlation_id`, `upstream.name/status/code`, `handled`, `<dep>.outcome`, `no_record`, `fallback`, `authz.*` (01), `consumer.action`/`publish.result` (05), `job.status` (06) | `correlation_id` |
+| **Span** | `http.response.status_code`, status (5xx), `error.type`, `exception.*` (agent), `http.request.header.<correlation header>` (captured) | `error_code` (hard failures only, §2.1), `error_key`, `<dependency>.<action>.failure` + `failure_count` (non-fatal errors, §2.1), `retry.count` (on per-purpose retry spans), `correlation_id`, `upstream.name/status/code`, `handled`, `<dep>.outcome`, `no_record`, `fallback`, `authz.*` (01), `<system>.kafka.<subject>.consumer.action` / `….publish.result` (05, named per 00 §6), `job.status` (06) | `correlation_id` |
 | **Logs** | one ERROR/WARN line at the point of failure with the MDC correlation id and the in-app `traceId` | the agent's `trace_id`/`span_id` in the pattern so the line opens the trace; the common MDC key `correlationId` | `correlationId`, `trace_id` |
 
 Support flow: client shows `{{ERR_PREFIX}}-4210465` + correlation id → trace query `{ span.correlation_id = "…" }` → the root span carries `error_code={{ERR_PREFIX}}-4210465`, `upstream.name=account-platform`, `upstream.status=503`, `upstream.code={{ERR_PREFIX}}-4310500`, `handled=mapped`; the CLIENT child has `peer.service=account-platform`, `http.response.status_code=503` → log query by `correlationId` shows the masked upstream body logged once in the mapping method.
@@ -51,8 +51,8 @@ public final class SpanOutcome {
   }
   /** a NON-FATAL error (caught, logged, the request carried on): NO error code here — one key named after the failed call, <call>.failure = short reason (§2.1) */
   public static void nonFatal(String call, Throwable cause) { nonFatal(call, Reason.of(cause), cause); }
-  public static void nonFatal(String call, String reason, Throwable cause) {   // call = "<dependency>.<action>", e.g. "support-case.create", "account-events.publish", "notification.email-send"
-    RequestSpan.failure(call, reason);                                    // 01 §6: support-case.create.failure = "HTTP 503" and failure_count on the root
+  public static void nonFatal(String call, String reason, Throwable cause) {   // call = "<dependency>.<action>", e.g. "support_case.create", "account_events.publish", "notification.email_send"
+    RequestSpan.failure(call, reason);                                    // 01 §6: support_case.create.failure = "HTTP 503" and failure_count on the root
     log.warn("non-fatal error call={} reason={} correlationId={}", call, reason, MDC.get("correlationId"), cause);   // the exception goes to the log, once, here — not onto the span (the agent's CLIENT/JDBC child already carries error.type for the call that failed)
   }
   // Reason.of(e): WebClientResponseException / RestClientResponseException → "HTTP <status>"; timeouts → "timeout"; ConnectException → "connection refused"; otherwise the exception's simple class name — never the message text
@@ -71,12 +71,12 @@ The error code from `02` is the mark of a **hard failure**: the program itself t
 | Case | What the program did | What goes on the span | What does NOT |
 |---|---|---|---|
 | **Hard failure** | stopped / failed the operation | `error_code`, `error_key`, `error.type`; 5xx → `recordException` + `ERROR` | — |
-| **Non-fatal error** | caught it and the request carried on (`onErrorReturn`, catch-all log, `.exceptionally`, fallback, "treated as processed") | one key per failed call, `<dependency>.<action>.failure` = short reason (`support-case.create.failure = "HTTP 503"`, `notification.email-send.failure = "timeout"`, `account-events.publish.failure = "retries exhausted (3)"`), + `failure_count`, + the decision facets of 04 (`<dep>.outcome=ignored\|fallback\|treated_as_success`, `handled`, `upstream.status/code`) | **no minted code**, no `error_key`, no `recordException`, status untouched — the client got a success and the span says so |
+| **Non-fatal error** | caught it and the request carried on (`onErrorReturn`, catch-all log, `.exceptionally`, fallback, "treated as processed") | one key per failed call, `<dependency>.<action>.failure` = short reason (`support_case.create.failure = "HTTP 503"`, `notification.email_send.failure = "timeout"`, `account_events.publish.failure = "retries exhausted (3)"`), + `failure_count`, + the decision facets of 04 (`<dep>.outcome=ignored\|fallback\|treated_as_success`, `handled`, `upstream.status/code`) | **no minted code**, no `error_key`, no `recordException`, status untouched — the client got a success and the span says so |
 | **Retried call** | tried again | a **count** on the call's own per-purpose span (`retry.count`, 04 §4.4) | no code for the attempts; a code only if the *final* outcome is a hard failure (handled by the two rows above) |
 
-* **The key names the call; the value says what went wrong.** `<dependency>` is the `peer.service` name (for messaging: the topic/exchange; for a job: the job name), `<action>` is the purpose of the call — the same words as `call.purpose` and the retry span name (04 §4.4), so the call attributes, the retry span and the failure key of one call read alike. The value is short and readable (`HTTP 503`, `timeout`, `connection refused`, `retries exhausted (3)`, or the exception's simple class name) — never the exception message, never an id.
-* **One key per call, never merged.** Two different calls to the same dependency get two keys (`billing-hub.register-user.failure`, `billing-hub.fetch-invoices.failure`). The same call failing twice in one request keeps the first reason. One call failing for many items inside a loop is **counted** (`job.items_failed`), not keyed per item.
-* **`failure_count`** is the number of `.failure` keys on the span. It exists because a query cannot match attribute *names* by pattern: `{ span.failure_count > 0 }` finds every request that carried on past a failure; the keys themselves say which calls. Key segments contain hyphens, so quote the key in TraceQL: `span."support-case.create.failure"`.
+* **The key names the call; the value says what went wrong.** `<dependency>` is the `peer.service` name (for messaging: the topic/exchange; for a job: the job name), `<action>` is the purpose of the call — the same words as the call's key prefix `<dependency>.<action>.*` (04 §4.1, 00 §6) and the retry span name (04 §4.4), so the call attributes, the retry span and the failure key of one call read alike. The value is short and readable (`HTTP 503`, `timeout`, `connection refused`, `retries exhausted (3)`, or the exception's simple class name) — never the exception message, never an id.
+* **One key per call, never merged.** Two different calls to the same dependency get two keys (`billing_hub.register_user.failure`, `billing_hub.fetch_invoices.failure`). The same call failing twice in one request keeps the first reason. One call failing for many items inside a loop is **counted** (`job.items_failed`), not keyed per item.
+* **`failure_count`** is the number of `.failure` keys on the span. It exists because a query cannot match attribute *names* by pattern: `{ span.failure_count > 0 }` finds every request that carried on past a failure; the keys themselves say which calls. Key segments contain hyphens, so quote the key in TraceQL: `span.support_case.create.failure`.
 * **The same problem may appear twice, in two places, and that is correct**: the service that hard-failed carries the full `{{ERR_PREFIX}}-` code on *its* span (it answered with an error); the caller that caught that answer and carried on carries `<dependency>.<action>.failure` (plus `upstream.code` = the code it received). Reading the trace top-down: failure key on the parent → code on the child.
 * Consequently `{ span.error_code != nil }` is exactly the set of spans whose service failed an operation, across the estate; `{ span.failure_count > 0 }` is the set of requests that succeeded while a call under them did not.
 * **Naming.** The key names the call that failed and ends in `.failure`; nothing in it describes what the code did with the exception — that is the `handled` / `<dep>.outcome` value `ignored` (caught, logged, carried on).
@@ -84,8 +84,8 @@ The error code from `02` is the mark of a **hard failure**: the program itself t
 What one trace looks like (an order is created; the support-case service is down; the order API catches the failure and still answers 201):
 ```
 order-api     SERVER  POST /orders                 status OK   http.response.status_code=201
-                      support-case.create.failure = "HTTP 503"   failure_count = 1   ← the call that failed, on the request that carried on
-                      support-case.outcome = ignored   handled = ignored   upstream.status = 503   upstream.code = {{ERR_PREFIX}}-5120460
+                      support_case.create.failure = "HTTP 503"   failure_count = 1   ← the call that failed, on the request that carried on
+                      support_case.outcome = ignored   handled = ignored   upstream.status = 503   upstream.code = {{ERR_PREFIX}}-5120460
                       (no error_code — the order API did not fail)
   └─ CLIENT  POST support-case                     error.type=503                               ← agent
 support-case  SERVER  POST /v1/tickets             status ERROR   http.response.status_code=503
@@ -94,11 +94,19 @@ support-case  SERVER  POST /v1/tickets             status ERROR   http.response.
 
 ---
 
+### 2.2 Use the error-code format the service already has — never a new one
+
+Every hard failure (§2.1) MUST carry an error code: in the response body (`errorCode`) and on the span (`error_code`). The code always comes from the service's **existing** format and catalogue (02): `{{ERR_PREFIX}}-<module><code>`, with the service's own registered module id.
+
+* **Reuse, do not reinvent.** Never introduce a new prefix, a new module id, a new numbering scheme or a second catalogue. Read the service's catalogue (`application-error-code.yaml`) or error enum first and use its keys.
+* **A hard-failure path that answers without a code** (a bare `500`/`400`/`401`, a generic `Exception` handler, a status with an empty body): add a key to the **existing** catalogue/enum with the next free number in the right band (02 §4), throw the service's application exception with it, and let the existing handler return it and call `SpanOutcome.record`.
+* **Only hard failures get a code** — non-fatal and retried calls keep the §2.1 rows (`<dependency>.<action>.failure`, `retry.count`).
+
 ## 3. Rule B — dependency outcomes are registered where the call is made (04 §4.3)
 
 ```java
 // existing handleErrorResponse / onErrorMap / catch(RestClientResponseException) — the CLIENT span has already ended; write on the ROOT
-RequestSpan.set("account-platform.outcome", "mapped");            // per dependency (default "pending" written before the call, "ok" on success)
+RequestSpan.set("account_platform.outcome", "mapped");            // per dependency (default "pending" written before the call, "ok" on success)
 RequestSpan.setIfAbsent("upstream.name", "account-platform");    // first failing dependency wins; == peer.service of the CLIENT child
 RequestSpan.setIfAbsent("upstream.status", response.statusCode().value());
 RequestSpan.setIfAbsent("upstream.code", UpstreamCode.extract(body));   // first "errorCode" in the JSON body, "" if none — never the body
@@ -120,10 +128,10 @@ throw new AppException(INTERNAL_SERVER_ERROR, errorProperties.getErrorCode(Error
 | `result_count` | service, after the page is built | `0` without `no_record` = genuinely empty |
 | `grants.accounts_fallback=true`, `fallback=no_permitted_accounts` | the permitted-accounts lookup when it fails and the code proceeds | success despite an authorisation-data failure |
 | `fallback=enrichment_failed` | an enrichment `.exceptionally` | rows returned without the enrichment because an upstream failed |
-| `support-case.outcome=ignored`, `fallback=empty_support_case`, `support-case.create.failure="HTTP 503"` | a support-case creation wrapped in `onErrorReturn` | order created, ticket never created — a failure key, not a code (§2.1) |
+| `support_case.outcome=ignored`, `fallback=empty_support_case`, `support_case.create.failure="HTTP 503"` | a support-case creation wrapped in `onErrorReturn` | order created, ticket never created — a failure key, not a code (§2.1) |
 | `integration.outcome=treated_as_success` | a socket timeout reported as `PROCESSED` | the most dangerous class — always registered |
-| `consumer.action=skipped`, `skip_reason` | consumer filters / listener catch (05) | message dropped |
-| `publish.result=exhausted` | `@Recover` (05) | event never emitted |
+| `<system>.kafka.<subject>.consumer.action=skipped`, `….skip_reason` | consumer filters / listener catch (05) | message dropped |
+| `<system>.kafka.<subject>.publish.result=exhausted` | `@Recover` (05) | event never emitted |
 | `authz.decision=deny\|error`, `authz.reason` | authorisation engines (01 §4) | why a 401/403 happened, or a fail-closed deny |
 
 Rule: **default first, overwrite on the exceptional path**, so every span of the endpoint has the key.
@@ -156,7 +164,7 @@ Never logged/traced: JWTs, API keys, SASL/cloud credentials, DB passwords, full 
 { span.error_code = "{{ERR_PREFIX}}-4210465" } >> { span.peer.service = "account-platform" } | select(span.http.response.status_code)
 { kind = server && span.http.response.status_code = 200 && span.handled = "ignored" } | by(span.upstream.name)   -- success that was not
 { span.failure_count > 0 } | by(resource.service.name, span.http.route)                                                          -- requests that carried on past a failed call (§2.1)
-{ span."support-case.create.failure" != nil } | by(span."support-case.create.failure")                                  -- one call: how often, and why
+{ span.support_case.create.failure != nil } | by(span.support_case.create.failure)                                  -- one call: how often, and why
 { name =~ ".* retry$" && span.retry.count > 0 } | by(name, span.retry.outcome)                                      -- per-purpose retry spans (04 §4.4)
 { span.no_record = true } | by(span.http.route)
 { span.authz.decision = "deny" } | by(span.authz.provider, span.authz.reason)
@@ -177,7 +185,7 @@ Never logged/traced: JWTs, API keys, SASL/cloud credentials, DB passwords, full 
 | Role | Rule A | Rule B | Rule C |
 |---|---|---|---|
 | API with its own advice | the `@RestControllerAdvice` handlers (+ policy advice) | every client mapping method (`onErrorMap`, `handleErrorResponse`, `catch (RestClientResponseException)`), fail-closed clients (`fail_closed`), "timeout → processed" clients (`treated_as_success`) | no-record advices; fallback paths; enrichment `.exceptionally`; gates; caches |
-| API using the library's global handler | throw sites + `afterCompletion` interceptor | the client utility (+ `upstream.name` from the caller name; 400/404 = `passthrough`) | ignored support-case creation failure, e-mail dispatch (`publish.result`), async dispatch |
+| API using the library's global handler | throw sites + `afterCompletion` interceptor | the client utility (+ `upstream.name` from the caller name; 400/404 = `passthrough`) | ignored support-case creation failure, e-mail dispatch (`<system>.<kafka|rabbitmq>.<subject>.publish.result`), async dispatch |
 | WebFlux service | the `ErrorWebExceptionHandler` (name-based codes) | policy client (its retry loop is a per-purpose retry span, 04 §4.4), gRPC clients | act-on-behalf filter (`authz.*`) |
 | Consumers / jobs | listener catch / `JobRun` (05 K3, 06 J1) | same as API | skip reasons, exhausted publishes |
 | Node servers | global error middleware (07 N5) | axios interceptor / proxy `onProxyRes` (07 N4) | cache fallbacks, ignored notification failures |
@@ -186,6 +194,7 @@ Never logged/traced: JWTs, API keys, SASL/cloud credentials, DB passwords, full 
 
 ## 8. Checklist — outcomes for one endpoint / listener / job
 
+- [ ] Every hard failure returns and records a code in the service's **existing** format and catalogue (`{{ERR_PREFIX}}-<module><code>`, §2.2); no new prefix, module or scheme; bare-status hard failures given a key in the existing catalogue
 - [ ] `SpanOutcome.record(code, key, status, cause)` called from the single exception handler (or throw sites) — only writer of `error_code`; `error.type` set; 5xx → `recordException` once + `ERROR`; 4xx → attributes only
 - [ ] Every outbound mapping method writes `<dep>.outcome` and, on the first failure, `upstream.name/status/code` + `handled` on the root before throwing/returning; ignored, fallback and treated-as-success paths write `<dependency>.<action>.failure` (`SpanOutcome.nonFatal`) and carry **no** minted code (§2.1)
 - [ ] Every retrying call (HTTP, messaging, anything) has its own per-purpose span with `retry.count` / `max` / `outcome` (04 §4.4); no code for the attempts, no span per attempt written by code

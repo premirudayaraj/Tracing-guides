@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Distributed Tracing</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#F4F6F8; --surface:#FFFFFF; --ink:#16202A; --muted:#566370; --rule:#D5DCE2; --soft:#E9EDF1;
+  --logs:#5B4BC4; --traces:#0B7F74; --fail:#C62F3B; --metrics:#A86300;
+  --sans:"IBM Plex Sans",-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){ --paper:#10161C; --surface:#18212A; --ink:#E3E9EE; --muted:#93A1AD; --rule:#2A3642; --soft:#1F2A34; --logs:#A193F2; --traces:#3CC2B2; --fail:#F06470; --metrics:#E0A040; }
+}
+:root[data-theme="dark"]{ --paper:#10161C; --surface:#18212A; --ink:#E3E9EE; --muted:#93A1AD; --rule:#2A3642; --soft:#1F2A34; --logs:#A193F2; --traces:#3CC2B2; --fail:#F06470; --metrics:#E0A040; }
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-snap-type:y proximity}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.slide{min-height:100vh;scroll-snap-align:start;padding:48px 24px 72px;border-top:1px solid var(--rule);display:flex;align-items:center}
+.slide:first-child{border-top:0}
+.wrap{width:100%;max-width:1200px;margin:0 auto;min-width:0}
+.kicker{font-family:var(--mono);font-size:.78rem;color:var(--traces);letter-spacing:.04em;text-transform:uppercase;margin-bottom:8px}
+h1{font-size:clamp(2.2rem,5.5vw,3.8rem);line-height:1.05;letter-spacing:-.02em;margin:0 0 18px;font-weight:600}
+h2{font-size:clamp(1.5rem,3.2vw,2.2rem);line-height:1.15;margin:0 0 6px;font-weight:600}
+.sub{color:var(--muted);margin:0 0 22px;font-size:1.05rem}
+code,.mono{font-family:var(--mono);font-size:.86em;white-space:nowrap}
+table.t.nw td{white-space:nowrap}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.grid2.wide{grid-template-columns:1.35fr 1fr}
+.grid2>*,.grid3>*{min-width:0}
+@media (max-width:860px){.grid2,.grid3,.grid2.wide{grid-template-columns:1fr}}
+.card{background:var(--surface);border:1px solid var(--rule);border-radius:10px;padding:18px;min-width:0}
+.card h3{margin:0 0 8px;font-size:1rem}
+.card.t{border-top:3px solid var(--traces)} .card.l{border-top:3px solid var(--logs)} .card.f{border-top:3px solid var(--fail)}
+.big{font-size:1.25rem;font-weight:600}
+ul.tight{margin:6px 0 0;padding-left:1.1em} ul.tight li{margin:3px 0}
+.wrapx{overflow-x:auto;max-width:100%}
+table.t{border-collapse:collapse;width:100%;font-size:.84rem;background:var(--surface)}
+table.t th,table.t td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--rule);vertical-align:top}
+table.t th{background:var(--soft);font-weight:600;white-space:nowrap}
+table.t td.m{font-family:var(--mono);font-size:.78rem}
+table.t tr.bad td{color:var(--fail)}
+table.t tr.hit td{background:color-mix(in srgb,var(--fail) 10%,var(--surface))}
+.q{font-family:var(--mono);font-size:.78rem;background:var(--soft);border:1px solid var(--rule);border-radius:6px;padding:6px 9px;display:block;overflow-x:auto;white-space:pre}
+.chip{display:inline-block;font-family:var(--mono);font-size:.74rem;border:1px solid var(--traces);color:var(--traces);border-radius:4px;padding:1px 6px;margin:2px 3px 2px 0;background:color-mix(in srgb,var(--traces) 7%,var(--surface))}
+.chip.ag{border-color:var(--rule);color:var(--muted);background:var(--soft)}
+.chip.bad{border-color:var(--fail);color:var(--fail);background:color-mix(in srgb,var(--fail) 8%,var(--surface))}
+.legend{font-size:.8rem;color:var(--muted);margin-top:10px}
+/* waterfall */
+.wf{background:var(--surface);border:1px solid var(--rule);border-radius:10px;padding:14px 16px}
+.wfrow{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(120px,1fr) 56px;gap:10px;align-items:center;padding:6px 0 0}
+.wfname{font-family:var(--mono);font-size:.78rem}
+.kind{display:inline-block;min-width:54px;font-size:.66rem;font-weight:600;color:var(--muted)}
+.track{position:relative;height:12px;background:var(--soft);border-radius:3px}
+.bar{position:absolute;top:0;bottom:0;border-radius:3px;background:var(--traces)}
+.bar.e{background:var(--fail)}
+.dur{font-family:var(--mono);font-size:.78rem;color:var(--muted);text-align:right}
+.chips{padding:2px 0 8px;border-bottom:1px dashed var(--rule)}
+.chips .lab{font-size:.7rem;color:var(--muted);margin-right:6px}
+/* essay vs notes */
+.essay{font-family:Georgia,serif;font-size:.95rem;line-height:1.6;color:var(--ink)}
+.notes{font-family:var(--mono);font-size:.84rem;line-height:1.75}
+.notes b{color:var(--traces);font-weight:500}
+.read{margin-top:14px;font-size:.95rem}
+/* code */
+pre.code{margin:0;background:var(--surface);border:1px solid var(--rule);border-radius:10px;padding:14px;font-family:var(--mono);font-size:.74rem;line-height:1.6;overflow-x:auto;white-space:pre}
+pre.code .lg{color:var(--logs);font-weight:500}
+pre.code .tr{color:var(--traces);font-weight:500}
+pre.code .cm{color:var(--muted)}
+pre.logs{margin:0;background:#0F151B;color:#C9D3DC;border-radius:10px;padding:12px;font-family:var(--mono);font-size:.66rem;line-height:1.5;overflow:auto;max-height:440px;white-space:pre}
+pre.logs .e{color:#FF8A94} pre.logs .w{color:#E8C170}
+.steps{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+.steps div{background:var(--surface);border:1px solid var(--rule);border-radius:8px;padding:8px 12px;font-size:.88rem}
+.steps b{color:var(--traces)}
+.cause{margin-top:12px;border-left:3px solid var(--fail);padding:8px 12px;background:var(--surface);border-radius:0 8px 8px 0;font-size:.95rem}
+/* analytics */
+.an h3{font-size:.95rem}
+.an .q{margin:6px 0 10px}
+.barcell{display:flex;align-items:center;gap:8px}
+.barcell i{display:block;height:8px;border-radius:2px;background:var(--traces)}
+.barcell i.e{background:var(--fail)}
+/* docs */
+.doc{background:var(--surface);border:1px solid var(--rule);border-radius:10px;padding:18px 20px}
+.doc .crumb{font-size:.78rem;color:var(--muted)}
+.doc h3{margin:14px 0 6px;font-size:.98rem}
+.toc{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px}
+.toc span{font-size:.74rem;border:1px solid var(--rule);border-radius:12px;padding:2px 8px;background:var(--soft)}
+.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:14px 0}
+.flow div{background:var(--surface);border:1px solid var(--rule);border-radius:8px;padding:10px 12px;font-size:.88rem}
+.flow b{display:block;color:var(--traces)}
+@media (max-width:860px){.flow{grid-template-columns:1fr 1fr}}
+.gl td:first-child{font-family:var(--mono);white-space:nowrap}
+/* transaction table */
+.tq th.grp{text-align:center;font-size:.76rem;color:var(--muted)}
+.tq th.k{font-family:var(--mono);font-size:.7rem}
+.tq td{font-family:var(--mono);font-size:.74rem;white-space:nowrap}
+.tq th,.tq td{white-space:nowrap}
+.tq .g0{border-left:1px solid var(--rule)}
+.tq tr.band td{background:var(--soft)}
+.tq tr.err td.st{color:var(--fail);font-weight:600}
+.tq td.v-err{color:var(--fail);font-weight:600}
+.tq td.dur{text-align:right}
+.tq .cid{background:none;border:0;padding:0;color:var(--traces);text-decoration:underline;font:inherit;cursor:pointer}
+.btns{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
+button{font:inherit;font-size:.86rem;cursor:pointer;border:1px solid var(--rule);background:var(--surface);color:var(--ink);padding:6px 12px;border-radius:6px}
+button[aria-pressed="true"]{background:var(--traces);border-color:var(--traces);color:#fff}
+button:focus-visible{outline:3px solid var(--traces);outline-offset:2px}
+.count{font-size:.85rem;color:var(--muted);margin:6px 0}
+.nav{position:fixed;right:16px;bottom:14px;display:flex;gap:6px;align-items:center;z-index:5}
+.nav span{font-family:var(--mono);font-size:.8rem;color:var(--muted);background:var(--surface);border:1px solid var(--rule);border-radius:6px;padding:5px 9px}
+.note{font-size:.78rem;color:var(--muted);margin-top:10px}
+
+.placebox{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;margin-top:14px}
+.chip.new{animation:pop .5s ease}
+html{scroll-snap-type:none}
+.slide{min-height:0;display:block;scroll-snap-align:none;padding:36px 24px 28px}
+.slide:last-child{padding-bottom:64px}
+h3.subh{font-size:1.2rem;margin:30px 0 4px}
+ul.pts{margin:12px 0 14px;padding-left:1.2em;font-size:1.02rem}
+ul.pts li{margin:6px 0}
+ul.pts ul{margin:4px 0;padding-left:1.2em}
+@keyframes pop{0%{transform:scale(.6);opacity:0}100%{transform:scale(1);opacity:1}}
+@media (prefers-reduced-motion:reduce){.chip.new{animation:none}}
+.ex{font-size:.92rem}
+.ex b{color:var(--traces)}
+table.cmp td{font-size:.95rem;padding:10px 14px}
+table.cmp th{font-size:.95rem}
+.st3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:14px}
+@media (max-width:860px){.st3{grid-template-columns:1fr}.placebox{grid-template-columns:1fr}}
+.stmt{margin:18px 0 10px;font-size:1.05rem;border-left:3px solid var(--traces);padding:6px 12px;background:var(--surface);border-radius:0 8px 8px 0}
+.track{overflow:visible}
+.dot{position:absolute;top:50%;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;border-radius:50%;background:#fff;border:2px solid var(--traces);box-shadow:0 0 0 2px color-mix(in srgb,var(--traces) 30%,transparent);z-index:2}
+.dot.bad{border-color:var(--ink)}
+.flyer{position:fixed;width:11px;height:11px;margin:-5.5px 0 0 -5.5px;border-radius:50%;background:var(--traces);z-index:50;pointer-events:none;box-shadow:0 0 10px var(--traces)}
+.flyer.bad{background:var(--fail);box-shadow:0 0 10px var(--fail)}
+.setl{display:inline-block;border-radius:3px;padding:0 3px;margin:0 -3px;transition:background .2s}
+.setl.on{background:color-mix(in srgb,var(--traces) 22%,transparent)}
+.setl.done{opacity:.55}
+.mesh{position:relative;padding:12px 14px}
+.mesh svg{width:100%;height:auto;display:block;max-height:520px}
+.mesh .ring{fill:none;stroke:var(--rule);stroke-dasharray:4 6}
+.mesh line.e{stroke:var(--rule);stroke-width:1.8}
+.mesh line.e.bad{stroke:var(--fail);stroke-width:4}
+.mesh .nd rect{fill:var(--surface);stroke:var(--muted);stroke-width:1.3}
+.mesh .nd.bad rect{stroke:var(--fail);stroke-width:2;fill:color-mix(in srgb,var(--fail) 14%,var(--surface))}
+.mesh .nd text{fill:var(--ink);font-family:var(--mono);font-size:12.5px;text-anchor:middle}
+.mesh .step circle{fill:var(--fail)}.mesh .step text{fill:#fff;font-size:12px;font-weight:600;text-anchor:middle;font-family:var(--sans)}
+.mesh .edges line{stroke:var(--rule);stroke-width:2.5;transition:stroke .3s}
+.mesh .edges line.on{stroke:var(--traces);stroke-width:3.5}
+.mesh .edges line.bad{stroke:var(--fail);stroke-width:4}
+.mesh .nodes rect{fill:var(--surface);stroke:var(--muted);stroke-width:1.5;transition:fill .3s,stroke .3s}
+.mesh .nodes text{fill:var(--ink);font-family:var(--mono);font-size:13px;text-anchor:middle}
+.mesh .nodes g.on rect{stroke:var(--traces);fill:color-mix(in srgb,var(--traces) 12%,var(--surface))}
+.mesh .nodes g.bad rect{stroke:var(--fail);fill:color-mix(in srgb,var(--fail) 14%,var(--surface))}
+.meshcap{font-size:.95rem;margin:6px 0 10px;min-height:1.5em}
+.meshcap.alert{color:var(--fail);font-weight:600}
+svg.tl{width:100%;height:auto;display:block}
+svg.tl .thr{stroke:var(--fail);stroke-dasharray:5 4;stroke-width:1.5}
+svg.tl .axl,svg.tl .ax text{fill:var(--muted);font-size:11px;font-family:var(--mono)}
+svg.tl rect{fill:var(--traces)} svg.tl rect.hi{fill:var(--fail)}
+.kpi{margin-top:8px;font-size:.92rem}.kpi b{font-size:1.5rem;display:inline-block;margin-right:4px}.kpi span{color:var(--muted)}
+svg.spark{width:100%;height:auto;margin-top:8px}
+svg.spark polyline{fill:none;stroke-width:2.5}svg.spark .ok{stroke:var(--traces)}svg.spark .up{stroke:var(--fail)}
+.ecode{font-family:var(--mono);font-size:clamp(2rem,6vw,3.4rem);font-weight:500;display:flex;gap:4px;margin:10px 0 4px}
+.ecode span{padding:2px 10px;border-radius:6px}
+.ecode .p{background:var(--soft)}.ecode .m{background:color-mix(in srgb,var(--traces) 16%,var(--surface))}.ecode .c{background:color-mix(in srgb,var(--fail) 14%,var(--surface))}
+.ecap{display:flex;gap:4px;font-size:.8rem;color:var(--muted);margin-bottom:10px;flex-wrap:wrap}
+.ecap span{padding:0 10px}
+@media (max-width:860px){.flow{grid-template-columns:1fr 1fr}}
+.kpi em.tag{font-style:normal;font-weight:600;color:var(--traces)}.kpi em.tag.bad{color:var(--fail)}
+</style>
+</head>
+<body>
+
+<section class="slide" id="s1"><div class="wrap"><h2>1. Introduction — the goal</h2>
+<ul class="pts">
+<li>Everyone in North America works on different projects and has no visibility beyond the microservices they work on.</li>
+<li>The goal: give everyone visibility across all the microservices, so they can quickly understand what is happening inside any service, with the documentation to go with it.</li>
+<li>This is practical only through <b>distributed tracing</b>. When every application registers traces alongside logs, the decision-making process inside each service becomes fully visible.</li>
+<li>Even before looking into the code, people should be able to tell from the distributed traces alone:</li>
+</ul>
+<div class="st3">
+ <div class="card f"><b>What is going wrong</b><br>with the application</div>
+ <div class="card t"><b>What has to be fixed</b></div>
+ <div class="card l"><b>Which teams to contact</b></div>
+</div></div></section>
+
+<section class="slide" id="s2"><div class="wrap"><h2>2. Why — the missing data in the transaction table</h2>
+<ul class="pts">
+<li>The missing database is not a DBMS. It is the <b>Tempo</b> database, the transaction table where distributed traces are registered (in Grafana, Tempo stores the traces and TraceQL shows them as this table).</li>
+<li>Today span registration into that table exists, but it is very minimal. The traces inside each application are missing.</li>
+<li>The plain transaction table as it was created at the start: only the HTTP request, service name, start, duration and trace id. Nothing about who, why or what was decided, and no correlation id.</li>
+</ul>
+<div class="wrapx"><table class="t nw"><thead><tr><th>Start</th><th>Trace id</th><th>Service</th><th>Span (HTTP request)</th><th>Duration</th></tr></thead><tbody>
+<tr><td class="m">09:02:00.000</td><td class="m">a7c1e1</td><td class="m">UECP-PO-MANAGEMENT</td><td class="m">GET /v1/po/accounts/can</td><td class="m">4.8 s</td></tr>
+<tr><td class="m">09:02:00.030</td><td class="m">a7c1e1</td><td class="m">platform-billing-account-service</td><td class="m">POST /billing/v2/billingAccounts/account-search/company</td><td class="m">4.7 s</td></tr>
+</tbody></table></div>
+<ul class="pts">
+<li>When that table gets filled, we get real distributed tracing, and that is how issues get found.</li>
+<li>In a monolith, logs were the plain source for everything. In microservices, logs only explain; distributed tracing is how you find the issue.</li>
+<li>Role of log: <b style="color:var(--logs)">Loki</b>. Role of trace: <b style="color:var(--traces)">Tempo</b>.</li>
+</ul>
+<div class="wrapx"><table class="t cmp"><thead><tr><th style="color:var(--logs)">Logs (Loki)</th><th style="color:var(--traces)">Distributed tracing (Tempo)</th></tr></thead><tbody>
+<tr><td rowspan="4" style="vertical-align:middle">Explain the unique issue in detail</td><td>Why</td></tr>
+<tr><td>Where</td></tr><tr><td>How</td></tr><tr><td>Impact radius</td></tr>
+</tbody></table></div></div></section>
+
+<section class="slide" id="s3"><div class="wrap"><h2>3. A span's attributes are short messages</h2>
+<ul class="pts">
+<li>A span is one step of a request; a step inside it is a child span. One request = one trace.</li>
+<li>How a span is placed: one bar per span with its duration, the failed span in red.</li>
+</ul>
+<div class="wf"><div class="wfrow"><div class="wfname"><span class="kind">SERVER</span>UECP-PO-MANAGEMENT · GET /v1/po/accounts/can</div><div class="track"><div class="bar e" style="left:0%;width:100%"></div></div><div class="dur">4.8 s</div></div><div class="chips" id="c1"></div><div class="wfrow"><div class="wfname">&nbsp;&nbsp;&nbsp;&nbsp;└ <span class="kind">CLIENT</span>UECP-PO-MANAGEMENT · POST → platform-billing-account-service</div><div class="track"><div class="bar e" style="left:0.4%;width:99.6%"></div></div><div class="dur">4.8 s</div></div><div class="chips" id="c2"></div><div class="wfrow"><div class="wfname">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└ <span class="kind">SERVER</span>platform-billing-account-service · POST /billing/v2/billingAccounts/account-search/company</div><div class="track"><div class="bar e" style="left:0.6%;width:97.9%"></div></div><div class="dur">4.7 s</div></div><div class="chips" id="c3"></div><div class="wfrow"><div class="wfname">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└ <span class="kind">CLIENT</span>platform-billing-account-service · SELECT (database, account search)</div><div class="track"><div class="bar e" style="left:0.9%;width:95.8%"></div></div><div class="dur">4.6 s</div></div><div class="chips" id="c4"></div></div>
+<ul class="pts">
+<li>How one attribute is placed on a span: the code line <code>RequestSpan.set("pbas.usermail", "xyz@mail.com")</code> puts <code>pbas.usermail = xyz@mail.com</code> on that request's span. Press Play: each line lands as a dot on a span, so every span ends up carrying several attributes. (The animation is for understanding only: in the code, <code>RequestSpan.set</code> places attributes on the request span.)</li>
+<li>Syntax analogy: logs use <code>log.debug</code>, <code>log.error</code>; tracing uses <code>RequestSpan.set(...)</code> the same way.</li>
+</ul>
+<div class="placebox"><div class="grid2">
+ <pre class="code"><span class="cm">// logs</span>
+<span class="lg">log.debug("calling PBAS company search");</span>
+<span class="lg">log.error("PBAS call failed : {}", e.getMessage());</span></pre>
+ <pre class="code" id="setcode"><span class="cm">// traces, the same way</span>
+<span class="tr setl" data-t="c1" data-k="correlation_id" data-v="CID-5e21b7" data-c="">RequestSpan.set("correlation_id", "CID-5e21b7");</span>
+<span class="tr setl" data-t="c1" data-k="user.id" data-v="u-30418" data-c="">RequestSpan.set("user.id", "u-30418");</span>
+<span class="tr setl" data-t="c1" data-k="org_id" data-v="org-55012" data-c="">RequestSpan.set("org_id", "org-55012");</span>
+<span class="tr setl" data-t="c1" data-k="pbas.usermail" data-v="xyz@mail.com" data-c="">RequestSpan.set("pbas.usermail", "xyz@mail.com");</span>
+<span class="tr setl" data-t="c2" data-k="call.purpose" data-v="pbas.company-account-search" data-c="">RequestSpan.set("call.purpose", "pbas.company-account-search");</span>
+<span class="tr setl" data-t="c2" data-k="call.page_size" data-v="50" data-c="">RequestSpan.set("call.page_size", "50");</span>
+<span class="tr setl" data-t="c3" data-k="caller.service" data-v="uecp-po-management" data-c="">RequestSpan.set("caller.service", "uecp-po-management");</span>
+<span class="tr setl" data-t="c3" data-k="caller.source" data-v="source-app-header" data-c="">RequestSpan.set("caller.source", "source-app-header");</span>
+<span class="tr setl" data-t="c3" data-k="authn.result" data-v="not_evaluated" data-c="">RequestSpan.set("authn.result", "not_evaluated");</span>
+<span class="tr setl" data-t="c4" data-k="error.type" data-v="SQLTimeoutException" data-c="bad">RequestSpan.set("error.type", "SQLTimeoutException");</span>
+<span class="tr setl" data-t="c3" data-k="error_code" data-v="EQ-1306162" data-c="bad">RequestSpan.set("error_code", "EQ-1306162");</span>
+<span class="tr setl" data-t="c3" data-k="error_key" data-v="ACCOUNT_SEARCH_FAILED" data-c="bad">RequestSpan.set("error_key", "ACCOUNT_SEARCH_FAILED");</span>
+<span class="tr setl" data-t="c1" data-k="pbas.outcome" data-v="mapped" data-c="bad">RequestSpan.set("pbas.outcome", "mapped");</span>
+<span class="tr setl" data-t="c1" data-k="upstream.name" data-v="pbas" data-c="">RequestSpan.set("upstream.name", "pbas");</span></pre>
+</div><button type="button" id="place">▶ Play: place the attributes</button></div>
+<ul class="pts"><li>What the spans hold, question by question:</li></ul>
+<div class="wrapx"><table class="t"><thead><tr><th>Question</th><th>Attributes</th><th>Example</th></tr></thead><tbody><tr><td><b>When</b></td><td class="m">span start, duration</td><td class="m">09:02:00.030 · 4.7 s</td></tr><tr><td><b>To whom</b></td><td class="m">user.id, org_id, channel_type, actor.present</td><td class="m">u-30418 · org-55012 · portal · false</td></tr><tr><td><b>Who called</b></td><td class="m">caller.service, caller.source</td><td class="m">uecp-po-management · source-app-header</td></tr><tr><td><b>Where</b></td><td class="m">service name, span name, parent span</td><td class="m">platform-billing-account-service · POST …/account-search/company</td></tr><tr><td><b>Why</b></td><td class="m">error_code, error_key, error.type, failure keys</td><td class="m">EQ-1306162 · ACCOUNT_SEARCH_FAILED · SQLTimeoutException</td></tr><tr><td><b>How</b></td><td class="m">path of spans, upstream.name, handled, pbas.outcome</td><td class="m">PO → PBAS → database · pbas · mapped</td></tr>
+<tr style="background:color-mix(in srgb,var(--logs) 8%,var(--surface))"><td><b>Description</b></td><td class="m">Loki: the one error log line, found by correlation_id</td><td class="m">full exception text + stack trace</td></tr></tbody></table>
+<ul class="pts">
+<li>Log vs trace, for the same moment:
+ <ul><li>the logs: a big scrollable chunk, four services mixed with other requests</li>
+ <li>the traces: the same failure as short notes on the spans</li></ul></li>
+</ul>
+<div class="grid2">
+ <div><div class="count">Loki, 4 services, 09:02:00–09:02:05 (mixed with other requests)</div><pre class="logs"><span>09:01:59.987 INFO  [UECP-BILLING] c.e.u.b.c.AccountsController   : POST /billing/v3/accounts/billing/search org=org-77120</span>
+<span>09:01:59.990 INFO  [platform-agreement-service] c.e.p.a.k.EchoSignSignature     : signature request received key=k-5521</span>
+<span>09:02:00.000 INFO  [UECP-PO-MANAGEMENT] c.e.u.p.f.CorrelationTracingFilter : GET /v1/po/accounts/can</span>
+<span>09:02:00.004 INFO  [UECP-BILLING] c.e.u.b.d.DefaultDIHService     : getInvoices accounts=3</span>
+<span>09:02:00.011 INFO  [UECP-PO-MANAGEMENT] c.e.u.p.s.AccountServiceImpl    : searchCompanyAccounts org=org-55012 page=50</span>
+<span>09:02:00.021 INFO  [UECP-PO-MANAGEMENT] c.e.u.p.e.p.PBASServiceImpl     : calling PBAS company search</span>
+<span>09:02:00.030 INFO  [platform-billing-account-service] c.e.p.b.f.RequestFilter          : POST /billing/v2/billingAccounts/account-search/company</span>
+<span>09:02:00.033 INFO  [platform-billing-account-service] c.e.p.b.s.AccountSearchService  : company account search started</span>
+<span>09:02:00.120 INFO  [platform-agreement-service] c.e.p.a.k.KafkaMessageSender    : publishing signature response</span>
+<span>09:02:00.410 INFO  [UECP-PO-MANAGEMENT] c.e.u.p.c.PurchaseOrderController : GET /v1/po/purchaseorders/orders 200</span>
+<span>09:02:00.512 INFO  [platform-billing-account-service] c.e.p.b.d.DIHAccountMessageV2Listener : DIH account event received</span>
+<span>09:02:00.513 INFO  [platform-billing-account-service] c.e.p.b.d.DIHAccountMessageV2Listener : not a billing account, skipping</span>
+<span class="w">09:02:01.002 WARN  [UECP-BILLING] c.e.u.b.s.AccountServiceImpl    : charges due enrichment failed: timeout</span>
+<span>09:02:01.340 INFO  [platform-agreement-service] c.e.p.a.k.KafkaMessageSender    : kafka acked topic=… partition=2 offset=55120</span>
+<span>09:02:02.118 INFO  [UECP-PO-MANAGEMENT] c.e.u.p.f.CorrelationTracingFilter : POST /v1/po/purchaseorders</span>
+<span class="w">09:02:02.402 WARN  [UECP-PO-MANAGEMENT] c.e.u.p.e.c.CSMServiceImpl      : non-fatal call=csm.create-support-case reason=HTTP 503</span>
+<span>09:02:03.300 INFO  [platform-billing-account-service] c.e.p.b.s.AccountSearchService  : company account search started</span>
+<span>09:02:03.511 INFO  [UECP-BILLING] c.e.u.b.c.AccountsController   : POST /billing/v3/accounts/company/search 403</span>
+<span class="e">09:02:04.690 ERROR [platform-billing-account-service] c.e.p.b.e.RestApiErrorHandler   : EQ-1306162 Account search failed</span>
+<span class="e">com.equinix.platform.exceptions.InternalServerException: Account search failed</span>
+<span class="e">    at c.e.p.b.s.AccountSearchService.searchCompany(AccountSearchService.java:212)</span>
+<span class="e">    at c.e.p.b.c.BillingAccountController.search(BillingAccountController.java:98)</span>
+<span class="e">Caused by: java.sql.SQLTimeoutException: ORA-01013: user requested cancel of current operation</span>
+<span class="e">    at oracle.jdbc.driver.T4CTTIoer11.processError(T4CTTIoer11.java:498)</span>
+<span class="e">    ... 87 more</span>
+<span>09:02:04.701 INFO  [platform-billing-account-service] c.e.p.b.k.KafkaSender           : account event sent</span>
+<span class="e">09:02:04.760 ERROR [UECP-PO-MANAGEMENT] c.e.u.p.e.p.PBASServiceImpl     : PBAS call failed org=org-55012 : 500 Internal Server Error</span>
+<span class="e">org.springframework.web.reactive.function.client.WebClientResponseException$InternalServerError: 500</span>
+<span class="e">    at o.s.w.r.f.c.WebClientResponseException.create(WebClientResponseException.java:250)</span>
+<span class="e">09:02:04.800 ERROR [UECP-PO-MANAGEMENT] c.e.u.p.f.FalconExceptionHandler : GET /v1/po/accounts/can 500</span>
+<span class="e">09:02:04.910 ERROR [UECP-BILLING] c.e.u.b.s.AccountServiceImpl    : PBAS account search failed 500</span>
+</pre></div>
+ <div><div class="card t"><h3>Notes (attributes on the spans)</h3><div class="notes">
+<b>correlation_id</b> = CID-5e21b7<br><b>org_id</b> = org-55012 &nbsp; <b>channel_type</b> = portal<br><b>call.purpose</b> = pbas.company-account-search<br><b>call.page_size</b> = 50<br><b>caller.service</b> = uecp-po-management<br><b>error_code</b> = EQ-1306162<br><b>error.type</b> = SQLTimeoutException · 4.6 s<br><b>pbas.outcome</b> = mapped &nbsp; <b>upstream.name</b> = pbas<br><b>status</b> = error · 4.8 s</div></div></div>
+</div>
+<ul class="pts"><li>How short attribute messages are read: who, where, why, how, when in a few seconds, and every note is searchable.</li></ul>
+<div class="read card" style="margin-top:8px"><b>who</b> org-55012 · <b>where</b> PBAS account search · <b>why</b> EQ-1306162, database timeout · <b>how</b> PO mapped it to 500 · <b>when</b> 09:02, 4.8 s</div>
+</div></section>
+
+<section class="slide" id="s4"><div class="wrap"><h2>4. Issue-finding with the table</h2>
+<ul class="pts">
+<li>This is where error debugging is shown, on the transaction table: every attribute a column. Pick a query; click a correlation id to follow it.</li>
+<li>One case: a create-billing-account request that starts in PBAS (platform-billing-account-service). Every service involved shows in the same table, because every row carries the same correlation id: authorization in PBAS, DIH, ATS, and the Kafka listener. That correlation id on every row is what joins them, and it is what is missing today.</li>
+<li><b>Example A</b> — PBAS refuses: the user is not authorised to create a billing account. The table shows the authorization decision and the error code on the PBAS span.</li>
+<li><b>Example B</b> — creation passes, PBAS calls DIH, the message id is registered; the Kafka listener picks the message up (maybe days later) and fails at one step. One query on the correlation id still brings all of it back in one table.</li>
+</ul>
+<div class="btns" role="group" aria-label="Choose a query">
+ <button type="button" data-tq="all" aria-pressed="true">All requests</button>
+ <button type="button" data-tq="a" aria-pressed="false">Example A</button>
+ <button type="button" data-tq="b" aria-pressed="false">Example B</button>
+ <button type="button" data-tq="err" aria-pressed="false">Only errors</button>
+ <button type="button" data-tq="svc" aria-pressed="false">One service</button>
+</div>
+<code class="q" id="tqQuery"></code><div class="count" id="tqCount"></div>
+<div class="wrapx" style="max-height:52vh;overflow:auto"><table class="t tq"><thead id="tqHead"></thead><tbody id="tqRows"></tbody></table></div>
+<div class="cause" id="tqCause" hidden></div>
+<div class="note">Rough tables. Values are made up (Tempo is empty); DIH values are imaginary. Attribute names are the ones in v2 and the guides. The ATS row is still to be filled from our ATS traces.</div>
+</div></section>
+
+<section class="slide" id="s5"><div class="wrap"><h2>5. Alerts on combination</h2>
+<ul class="pts">
+<li>In a microservice environment, logs cannot efficiently find a combination of issues. Issues might happen on a combination of different steps in different services. This can be derived using the structured data of the transaction table.</li>
+</ul>
+<div class="mesh card"><svg viewBox="0 0 900 480" role="img" aria-label="Many ECP microservices in a circle, connected to each other; one combination across UECP-PO-MANAGEMENT, PBAS and the database is marked red"><ellipse class="ring" cx="450" cy="240" rx="340" ry="190"/><line class="e" x1="450" y1="50" x2="598" y2="69"/><line class="e" x1="450" y1="50" x2="716" y2="122"/><line class="e" x1="450" y1="50" x2="781" y2="282"/><line class="e" x1="598" y1="69" x2="781" y2="198"/><line class="e" x1="598" y1="69" x2="598" y2="411"/><line class="e" x1="598" y1="69" x2="184" y2="122"/><line class="e" x1="716" y1="122" x2="119" y2="198"/><line class="e" x1="716" y1="122" x2="184" y2="122"/><line class="e" x1="781" y1="198" x2="781" y2="282"/><line class="e" x1="781" y1="198" x2="716" y2="358"/><line class="e" x1="781" y1="198" x2="119" y2="282"/><line class="e" x1="781" y1="198" x2="184" y2="358"/><line class="e" x1="716" y1="358" x2="598" y2="411"/><line class="e" x1="598" y1="411" x2="450" y2="430"/><line class="e" x1="781" y1="282" x2="302" y2="69"/><line class="e" x1="781" y1="282" x2="184" y2="358"/><line class="e" x1="781" y1="282" x2="716" y2="358"/><line class="e" x1="598" y1="69" x2="302" y2="411"/><line class="e" x1="119" y1="282" x2="184" y2="358"/><line class="e" x1="119" y1="198" x2="119" y2="282"/><line class="e bad" x1="716" y1="122" x2="781" y2="198"/><line class="e bad" x1="781" y1="198" x2="302" y2="411"/><g class="nd"><rect x="391" y="34" width="118" height="32" rx="16"/><text x="450" y="55">Portal / BFF</text></g><g class="nd"><rect x="538" y="53" width="118" height="32" rx="16"/><text x="598" y="74">UECP-BILLING</text></g><g class="nd bad"><rect x="632" y="106" width="168" height="32" rx="16"/><text x="716" y="127">UECP-PO-MANAGEMENT</text></g><g class="step"><circle cx="798" cy="106" r="11"/><text x="798" y="110">1</text></g><g class="nd bad"><rect x="746" y="182" width="70" height="32" rx="16"/><text x="781" y="203">PBAS</text></g><g class="step"><circle cx="814" cy="182" r="11"/><text x="814" y="186">2</text></g><g class="nd"><rect x="746" y="266" width="70" height="32" rx="16"/><text x="781" y="287">ATS</text></g><g class="nd"><rect x="681" y="342" width="70" height="32" rx="16"/><text x="716" y="363">Kafka</text></g><g class="nd"><rect x="563" y="395" width="70" height="32" rx="16"/><text x="598" y="416">DIH</text></g><g class="nd"><rect x="399" y="414" width="102" height="32" rx="16"/><text x="450" y="435">Oracle EBS</text></g><g class="nd bad"><rect x="260" y="395" width="86" height="32" rx="16"/><text x="302" y="416">Database</text></g><g class="step"><circle cx="343" cy="395" r="11"/><text x="343" y="399">3</text></g><g class="nd"><rect x="149" y="342" width="70" height="32" rx="16"/><text x="184" y="363">CRH</text></g><g class="nd"><rect x="84" y="266" width="70" height="32" rx="16"/><text x="119" y="287">SFDC</text></g><g class="nd"><rect x="84" y="182" width="70" height="32" rx="16"/><text x="119" y="203">CSM</text></g><g class="nd"><rect x="145" y="106" width="77" height="32" rx="16"/><text x="184" y="127">Bill UI</text></g><g class="nd"><rect x="251" y="53" width="102" height="32" rx="16"/><text x="302" y="74">Adobe Sign</text></g></svg>
+<div class="meshcap"><b style="color:var(--fail)">One combination:</b> ① PO maps a PBAS failure · ② PBAS answers EQ-1306162 · ③ the PBAS database timed out. Each step alone looks normal; together, in one request, they are the issue.</div>
+</div>
+<ul class="pts">
+<li>Alerts will also be set based on a combination of events in multiple services. Just like an SQL query, TraceQL will trigger on the combination to find the error.</li>
+<li>Graph representation of each event using a timeline and TraceQL.</li>
+</ul>
+</div></section>
+
+<section class="slide" id="s6"><div class="wrap"><h2>6. Predictive analytics</h2>
+<ul class="pts">
+<li>This opens up new possibilities in analytics and monitoring, with high-level precision.</li>
+<li>Answers like how many of the users got genuine issues.</li>
+<li>How many were impacted, and for what duration, when the service was down.</li>
+<li>What are the chances we might expect a failure in certain applications where retries are high.</li>
+</ul>
+</div></section>
+
+<section class="slide" id="s7"><div class="wrap"><h2>7. How can we bring this up immediately?</h2>
+<ul class="pts">
+<li>Currently we have no data at all in the transaction DB. Traces are a much lower-level threat than logs.</li>
+<li>So I have created .md files with detailed tracing guides. They follow the OpenTelemetry standards to place attributes on the spans of any selected project.</li>
+<li>The README section has the how-to-use guide: give it to Claude and tell it to place the traces as per the skill. Claude places the traces; the team reviews the change before it ships.</li>
+<li>Additionally, I have added a feature to create a Confluence page. It places the documentation for all the traces created, and self-explains why each was created and how we have to use it.</li>
+</ul>
+<div class="flow"><div><b>1 · Give the guides</b>to Claude on one service</div><div><b>2 · Traces placed</b>in the code, OpenTelemetry names</div><div><b>3 · Confluence page</b>one per service, same format</div><div><b>4 · Deploy</b>the transaction table fills</div></div>
+<div class="grid2">
+ <div class="wrapx"><table class="t gl"><thead><tr><th>Guide</th><th>Covers</th></tr></thead><tbody>
+ <tr><td>README.md</td><td>how to use it, the values to fill once</td></tr>
+ <tr><td>00</td><td>what the service is, key naming</td></tr>
+ <tr><td>01</td><td>request span: correlation id, caller, user, auth decisions</td></tr>
+ <tr><td>02 · 03</td><td>error codes and where they go</td></tr>
+ <tr><td>04</td><td>every outbound call: purpose, outcome, retries</td></tr>
+ <tr><td>05 · 06</td><td>Kafka / RabbitMQ, scheduled jobs</td></tr>
+ <tr><td>07</td><td>UI and Node BFF</td></tr>
+ <tr><td>09</td><td>publish the trace documentation to Confluence</td></tr>
+ </tbody></table></div>
+ <div class="doc"><div class="crumb">Confluence › product page › &lt;repository name&gt;</div>
+  <div class="toc"><span>1 Service</span><span>2 How to find traces</span><span>3 Trace map</span><span>4 Attributes</span><span>5 Outbound handovers</span><span>6 Messaging</span><span>7 Jobs</span><span>8 Error codes</span><span>9 Verification queries</span><span>10 Not traced and limits</span><span>11 Change log</span></div>
+  <div class="legend">The same 11 sections for every service: what each attribute is, why it was placed, and how to use it.</div></div>
+</div>
+</div></section>
+
+<section class="slide" id="s8"><div class="wrap"><h2>8. Error codes — mandatory on every error, registered on the span</h2>
+<ul class="pts">
+<li>Today we already have the error code format: <code>EQ-</code> + the 4-digit service module + the 3-digit code.</li>
+</ul>
+<div class="ecode"><span class="p">EQ-</span><span class="m">1306</span><span class="c">162</span></div>
+<div class="ecap"><span class="p">company prefix</span><span class="m">service module (PBAS)</span><span class="c">the error (account search failed)</span></div>
+<ul class="pts">
+<li>On every error, we register that error code, return it in the response, and register it on the trace.</li>
+<li>Our tracing skill (the MD guides) places the error code on hard failures: when there is a hard failure, it puts that error code on the span and in the response.</li>
+</ul>
+<div class="grid2">
+ <div class="card f"><h3>On the span today</h3><div class="notes"><b>http.response.status_code</b> = 500<br><b>status</b> = error</div><div class="legend">Which step? Why? Not on the span.</div></div>
+ <div class="card t"><h3>With the error code registered</h3><div class="notes"><b>http.response.status_code</b> = 500<br><b>error_code</b> = EQ-1306162<br><b>error_key</b> = ACCOUNT_SEARCH_FAILED<br><b>error.type</b> = SQLTimeoutException</div><div class="legend">The same code the client got in the response body.</div></div>
+</div>
+</div></section>
+
+<script>
+(function(){
+function $(id){ return document.getElementById(id); }
+/* place traces on the spans: each RequestSpan.set flies in as a dot */
+var running = 0, timers = [];
+var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+function resetSpans(){
+  timers.forEach(clearTimeout); timers = []; running++;
+  document.querySelectorAll('.dot,.flyer').forEach(function(d){ d.remove(); });
+  ['c1','c2','c3','c4'].forEach(function(id){ $(id).textContent = ''; });
+  document.querySelectorAll('.setl').forEach(function(l){ l.classList.remove('on','done'); });
+}
+function target(t, n){
+  var row = $(t).previousElementSibling, tr = row.querySelector('.track').getBoundingClientRect(), br = row.querySelector('.bar').getBoundingClientRect();
+  return {track: row.querySelector('.track'), x: Math.min(br.right - 8, br.left + 12 + n*18) - tr.left, gx: Math.min(br.right - 8, br.left + 12 + n*18), gy: tr.top + tr.height/2};
+}
+function land(line, n){
+  var t = line.getAttribute('data-t'), chips = $(t), g = target(t, n);
+  var d = document.createElement('div'); d.className = 'dot ' + line.getAttribute('data-c'); d.style.left = g.x + 'px'; g.track.appendChild(d);
+  if(!chips.firstChild){ var lab = document.createElement('span'); lab.className = 'lab'; lab.textContent = 'attributes on this span:'; chips.appendChild(lab); }
+  var c = document.createElement('span'); c.className = 'chip new ' + line.getAttribute('data-c');
+  c.textContent = line.getAttribute('data-k') + ' = ' + line.getAttribute('data-v'); chips.appendChild(c);
+  line.classList.remove('on'); line.classList.add('done');
+}
+$('place').addEventListener('click', function(){
+  resetSpans(); var run = running, lines = Array.prototype.slice.call(document.querySelectorAll('.setl')), count = {};
+  $('s3').querySelector('.wf').scrollIntoView({behavior: reduce ? 'auto' : 'smooth', block:'start'});
+  lines.forEach(function(line, i){
+    timers.push(setTimeout(function(){
+      if(run !== running) return;
+      var t = line.getAttribute('data-t'); count[t] = count[t] || 0; var n = count[t]++;
+      line.classList.add('on');
+      if(reduce || !document.body.animate){ land(line, n); return; }
+      var lr = line.getBoundingClientRect(), g = target(t, n);
+      var f = document.createElement('div'); f.className = 'flyer ' + line.getAttribute('data-c');
+      f.style.left = lr.right + 'px'; f.style.top = (lr.top + lr.height/2) + 'px'; document.body.appendChild(f);
+      var anim = f.animate([{transform:'translate(0,0)'},{transform:'translate(' + (g.gx - lr.right) + 'px,' + (g.gy - lr.top - lr.height/2) + 'px) scale(.8)'}], {duration:700, easing:'cubic-bezier(.4,0,.2,1)'});
+      anim.onfinish = function(){ f.remove(); if(run === running) land(line, n); };
+    }, 700 + i*800));
+  });
+  this.textContent = '↺ Replay';
+});
+window.addEventListener('resize', function(){ if(document.querySelector('.dot')){ resetSpans(); $('place').textContent = '▶ Play: place the attributes'; } });
+
+/* transaction table */
+var PCOLS = [["Request", ["correlation_id"]], ["Authorization (PBAS)", ["authn.result", "authz.decision", "authz.reason"]], ["Messaging and DIH", ["messaging.message.id", "dih.outcome"]], ["Errors", ["error_code"]]], TQALL = [{"t": "10:14:03.000", "id": "b71e20", "svc": "platform-billing-account-service", "span": "POST create billing account", "st": "error", "d": "0.2 s", "a": {"correlation_id": "CID-8d14f2", "authn.result": "ok", "authz.decision": "deny", "authz.reason": "no create permission", "error_code": "EQ-13xxxxx (not authorised)"}}, {"t": "Day 1 10:20:00.000", "id": "c40d91", "svc": "platform-billing-account-service", "span": "POST create billing account", "st": "ok", "d": "0.9 s", "a": {"correlation_id": "CID-3f9a07", "authz.decision": "allow"}}, {"t": "Day 1 10:20:00.600", "id": "c40d91", "svc": "platform-billing-account-service", "span": "publish oracle-ban-create-req (to DIH)", "st": "ok", "d": "0.1 s", "a": {"correlation_id": "CID-3f9a07", "messaging.message.id": "msg-77a2"}}, {"t": "Day 1 10:20:01.000", "id": "c40d91", "svc": "DIH (imaginary)", "span": "consume oracle-ban-create-req", "st": "ok", "d": "0.3 s", "a": {"correlation_id": "CID-3f9a07", "messaging.message.id": "msg-77a2", "dih.outcome": "accepted"}}, {"t": "\u2014", "id": "c40d91", "svc": "ATS", "span": "[from our ATS traces]", "st": "\u2014", "d": "\u2014", "a": {"correlation_id": "CID-3f9a07"}}, {"t": "Day 3 08:05:12.000", "id": "e51b36", "svc": "platform-billing-account-service", "span": "DIHAccountMessageV2Listener receive", "st": "error", "d": "0.4 s", "a": {"correlation_id": "CID-3f9a07", "messaging.message.id": "msg-91c4", "error_code": "EQ-13xxxxx (step that failed)"}}];
+function trace(cid){ var ids = {}; TQALL.forEach(function(r){ if(r.a.correlation_id === cid) ids[r.id] = 1; }); return function(r){ return !!ids[r.id]; }; }
+var PB = 'platform-billing-account-service';
+var TQ = {
+ all:{q:'{ }', f:function(){ return true; }},
+ a:{q:'{ span.correlation_id = "CID-8d14f2" }', f:trace('CID-8d14f2'), c:'<b>Refused in PBAS:</b> <code>authz.decision = deny</code>, no create permission → <code>EQ-13xxxxx</code> (not authorised).'},
+ b:{q:'{ span.correlation_id = "CID-3f9a07" }', f:trace('CID-3f9a07'), c:'<b>Two traces, days apart, one query:</b> created on day 1 and handed to DIH as <code>msg-77a2</code>. On day 3 the listener received <code>msg-91c4</code> and failed at one step → <code>EQ-13xxxxx</code>.'},
+ err:{q:'{ status = error }', f:function(r){ return r.st === 'error'; }},
+ svc:{q:'{ resource.service.name = "platform-billing-account-service" }', f:function(r){ return r.svc === PB; }}
+};
+function head(){
+  var th = $('tqHead'), r1 = document.createElement('tr'), r2 = document.createElement('tr');
+  var a = document.createElement('th'); a.colSpan = 6; a.className = 'grp'; a.textContent = 'Span'; r1.appendChild(a);
+  ['Start','Trace id','Service','Span','Status','Duration'].forEach(function(h){ var c = document.createElement('th'); c.textContent = h; r2.appendChild(c); });
+  PCOLS.forEach(function(g){ var c = document.createElement('th'); c.colSpan = g[1].length; c.className = 'grp g0'; c.textContent = g[0]; r1.appendChild(c);
+    g[1].forEach(function(k,i){ var d = document.createElement('th'); d.className = 'k' + (i ? '' : ' g0'); d.textContent = k; r2.appendChild(d); }); });
+  th.appendChild(r1); th.appendChild(r2);
+}
+var btns = Array.prototype.slice.call(document.querySelectorAll('[data-tq]'));
+function show(k, cid){
+  btns.forEach(function(b){ b.setAttribute('aria-pressed', String(b.getAttribute('data-tq') === k)); });
+  var q = TQ[k].q, f = TQ[k].f, cause = TQ[k].c;
+  if(cid){ q = '{ span.correlation_id = "' + cid + '" }'; f = trace(cid); cause = cid === 'CID-8d14f2' ? TQ.a.c : TQ.b.c; }
+  $('tqQuery').textContent = q;
+  var rows = TQALL.filter(f);
+  var t = {}, s = {}; rows.forEach(function(r){ t[r.id] = 1; s[r.svc] = 1; });
+  $('tqCount').textContent = rows.length + ' spans · ' + Object.keys(t).length + ' traces · ' + Object.keys(s).length + ' services';
+  var cz = $('tqCause'); if(cause){ cz.innerHTML = cause; cz.hidden = false; } else { cz.hidden = true; }
+  var body = $('tqRows'); body.textContent = ''; var last = null, band = false;
+  rows.forEach(function(r){
+    if(r.id !== last){ band = !band; last = r.id; }
+    var tr = document.createElement('tr'); if(band) tr.className = 'band'; if(r.st === 'error') tr.classList.add('err');
+    if(r.st === '—') tr.style.opacity = '.6';
+    [[r.t,''],[r.id,''],[r.svc,''],[r.span,''],[r.st,'st'],[r.d,'dur']].forEach(function(v){ var td = document.createElement('td'); td.textContent = v[0]; if(v[1]) td.className = v[1]; tr.appendChild(td); });
+    PCOLS.forEach(function(g){ g[1].forEach(function(key,i){
+      var td = document.createElement('td'), v = r.a[key]; if(!i) td.className = 'g0';
+      if(v !== undefined){
+        if(key === 'correlation_id'){ var b = document.createElement('button'); b.type = 'button'; b.className = 'cid'; b.textContent = v; b.addEventListener('click', function(){ show(v === 'CID-8d14f2' ? 'a' : 'b'); }); td.appendChild(b); }
+        else td.textContent = v;
+        if(/^error|\.failure$/.test(key) || v === 'deny') td.classList.add('v-err');
+      }
+      tr.appendChild(td); }); });
+    body.appendChild(tr);
+  });
+}
+head();
+btns.forEach(function(b){ b.addEventListener('click', function(){ show(b.getAttribute('data-tq')); }); });
+show('all');
+
+
+})();
+</script>
+</body>
+</html>

@@ -197,7 +197,7 @@ span.setAttribute("authz.provider", "db");  span.setAttribute("authz.policy", "a
 span.setAttribute("authz.provider", "role");  span.setAttribute("authz.policy", String.join(",", roleAllowed.value()));  span.setAttribute("authz.decision", ok ? "allow" : "deny");
 ```
 
-* **Key rule when engines can vary per request** (reference C: the identity check only when the hierarchy flag is on, the sidecar only when enabled, then ownership): every engine writes its own set `authz.<provider>.decision|policy|reason` (`authz.policy-engine.decision`, `authz.identity.decision`, `authz.policy-sidecar.decision`, `authz.db.decision`, `authz.role.decision`); the **plain** keys `authz.decision` / `authz.reason` are the **overall** outcome (`deny` if any engine denied, `error` if any failed closed, else `allow`) and `authz.decided_by` names the engine that produced a deny/error. A service with exactly one engine may write only the plain keys plus `authz.provider`. The snippets above show the plain form for brevity; apply this rule literally.
+* **Key rule when engines can vary per request** (reference C: the identity check only when the hierarchy flag is on, the sidecar only when enabled, then ownership): every engine writes its own set `authz.<provider>.decision|policy|reason` (`authz.policy_engine.decision`, `authz.identity.decision`, `authz.policy_sidecar.decision`, `authz.db.decision`, `authz.role.decision`); the **plain** keys `authz.decision` / `authz.reason` are the **overall** outcome (`deny` if any engine denied, `error` if any failed closed, else `allow`) and `authz.decided_by` names the engine that produced a deny/error. A service with exactly one engine may write only the plain keys plus `authz.provider`. The snippets above show the plain form for brevity; apply this rule literally.
 * `authz.reason` is the **catalogue key** of the code the deny maps to (`NOT_ENOUGH_PERMISSIONS`, `ACCOUNT_NOT_BELONGS_TO_USER`, `UNAUTHORIZED_RESOURCE_ACCESS`, `ACT_ON_BEHALF_DENIED`) — never a free-text reason; `error_code` (03) carries exactly what the response body carries (if a service today derives the code from the HTTP status instead of the catalogue, register it as is — the mismatch is what the attribute reveals; 02 §7.1).
 * Every deny/error is also an outcome (03): `error_code`, `error.type` = the exception class or the code; status `ERROR` only for 5xx-class failures (provider unreachable), **not** for a 403 — a deny is a correct answer.
 * The authorisation call itself is a CLIENT span (agent) under the SERVER span with `peer.service=policy-engine|identity|policy-sidecar|permission-api` (04 §3) — its duration is the answer to "is the policy engine slow"; the decision is on the parent.
@@ -275,8 +275,8 @@ public CompletableFuture<BillingAccountSearchResponse> searchBillingAccounts(Req
   if (commonService.isSupportOrgMode(ctx)) RequestSpan.set("account.filter", "org");
   RequestSpan.here("cache_hit", "false");                      // local to this unit of work → the @WithSpan span (default before the lookup)
   ...
-  RequestSpan.set("billing-hub.version", "v3");                // which upstream contract was chosen → root
-  RequestSpan.here("billing-hub.batches", String.valueOf(batches.size()));   // fan-out shape → this span
+  RequestSpan.set("billing_hub.version", "v3");                // which upstream contract was chosen → root
+  RequestSpan.here("billing_hub.batches", String.valueOf(batches.size()));   // fan-out shape → this span
   RequestSpan.set("result_count", result.size());              // root
   RequestSpan.set("no_record", result.isEmpty());              // root — "empty 200" advices make this invisible otherwise
   return ...;
@@ -291,7 +291,7 @@ Decision catalogue — register these whenever they exist (names in §7):
 | Feature flag evaluated | `flag.<key>=<variant>` for **every** flag evaluated on the request (one key per flag — a read-only-mode flag is often evaluated on every request, so most requests see more than one flag); additionally the standard `feature_flag.key` / `feature_flag.result.variant` / `feature_flag.provider.name` for the single flag that decided the code path of *this* span, if there is one | flag-provider gates (read-only mode, listener enable flags, migration toggles); `@ConditionalOnProperty` toggles are startup facts — one INFO line at startup, nothing per request |
 | Cache hit / miss | `cache_hit` (+ `cache.name`) | Redis user-context cache, OAuth token cache, in-memory principal cache, a Node help-topics cache fallback |
 | Fallback taken | `fallback=<what>` (`no_permitted_accounts`, `empty_contact`, `default_project_null`, `help_topics_cache`) | "lookup failed → proceed without filter" paths, a timeout → empty object, a hierarchy lookup → null |
-| Filter / skip | `skipped=true`, `skip_reason=<enum>` | listener filters (05), no-record → empty 200 advices |
+| Filter / skip | `skipped=true`, `skip_reason=<enum>` (request decisions); in a listener `<system>.kafka.<subject>.skip_reason` (05, 00 §6) | listener filters (05), no-record → empty 200 advices |
 | Version / route chosen | `<dep>.version` (`v1\|v2\|v3`), `strategy` | upstream v1/v2/v3 contracts, search-by-company vs search-by-account |
 | Fan-out shape | `<dep>.batches`, `batch_size`, `parallelism` | enrichment in batches of N, `CompletableFuture` joins |
 | Result | `result_count`, `no_record`, `truncated` (hard caps) | every service method returning a list/page |
@@ -325,7 +325,7 @@ public final class RequestSpan {
   public static void here(String key, String v){ Span.current().setAttribute(key, v); }   // on the innermost span
   /** first writer wins (the OTel API cannot read attributes back): a per-request Set<String> of written keys travels in the same Context */
   public static void setIfAbsent(String key, Object v) { Set<String> w = Context.current().get(WRITTEN); if (w == null || w.add(key)) setAny(root(), key, v); }
-  /** 03 §2.1: a call the request carried on past. Key = <call>.failure with <call> = "<dependency>.<action>" (e.g. "support-case.create"); value = short reason.
+  /** 03 §2.1: a call the request carried on past. Key = <call>.failure with <call> = "<dependency>.<action>" (e.g. "support_case.create"); value = short reason.
    *  First failure of a call wins; failure_count = number of calls that failed on this request (a query cannot match attribute names by pattern). */
   public static void failure(String call, String reason) {
     String key = AttrName.of(call + ".failure");                                                // company prefix added only when the dependency name is an OpenTelemetry namespace (00 §6)
@@ -343,8 +343,9 @@ public final class RequestSpan {
 // tracing/AttrName.java ➕ — the one place that decides whether a key needs the company prefix (00 §6)
 public final class AttrName {
   private static final Set<String> OTEL_NAMESPACES = Set.of("android", "app", "artifact", "aspnetcore", "aws", "azure", "browser", "cassandra", "cicd", "client", "cloud", "cloudevents", "cloudfoundry", "code", "container", "cpu", "cpython", "db", "deployment", "destination", "device", "disk", "dns", "dotnet", "elasticsearch", "enduser", "error", "event", "exception", "faas", "feature_flag", "file", "gcp", "gen_ai", "geo", "go", "graphql", "heroku", "host", "http", "hw", "ios", "jsonrpc", "jvm", "k8s", "linux", "log", "mainframe", "mcp", "messaging", "network", "nfs", "nodejs", "oci", "onc_rpc", "openai", "openshift", "opentracing", "oracle_cloud", "oracledb", "os", "otel", "peer", "pprof", "process", "profile", "rpc", "security_rule", "server", "service", "session", "signalr", "source", "system", "telemetry", "test", "thread", "tls", "url", "user", "user_agent", "v8js", "vcs", "webengine", "zos");   // 00 §6 list; refresh from the registry
-  /** "support-case.create.failure" → unchanged; "db.write.failure" → "{{PREFIX}}.db.write.failure" */
+  /** "support_case.create.failure" → unchanged; "db.write.failure" → "{{PREFIX}}.db.write.failure" */
   public static String of(String key) {
+    key = key.toLowerCase(java.util.Locale.ROOT).replace('-', '_'); // OpenTelemetry key characters: a-z 0-9 _ . (00 §6.1)
     int dot = key.indexOf('.'); String first = dot < 0 ? key : key.substring(0, dot);
     return OTEL_NAMESPACES.contains(first) ? "{{PREFIX}}." + key : key;
   }
@@ -376,8 +377,8 @@ Use `AttrName.of(...)` for every key whose first group comes from a **name** (de
 | Decisions | `cache_hit`, `cache.name`, `fallback`, `skipped`, `skip_reason`, `<dep>.version`, `strategy`, `account.filter`, `gate.readonly`, `flag.<key>`, `validation.failed`, `validation.field_count`, `retry.count`, `retry.max`, `retry.outcome` (`succeeded\|exhausted\|aborted`, on the per-purpose retry span — 04 §4.4), `timeout_ms` |
 | Shape / result | `page_size`, `page_offset`, `sort`, `search_scope`, `batch_size`, `<dep>.batches`, `parallelism`, `result_count`, `no_record`, `truncated` |
 | Outcome (03) | `error_code` (exactly the response body's code — **hard failures only**, 03 §2.1), `error_key`, `<dependency>.<action>.failure` (one key per call the request carried on past; value = short reason `HTTP 503\|timeout\|connection refused\|retries exhausted (n)\|<ExceptionClass>`), `failure_count` (how many such keys), `upstream.name`, `upstream.status`, `upstream.code` (first failing dependency wins), `handled` (`mapped\|passthrough\|ignored\|fallback\|treated_as_success\|fail_closed\|rethrown`) |
-| Handover (04) | `call.purpose`, `call.version`, `call.id`, `call.ids_count`, `call.flags`, `call.page_size`, `call.<purpose>.*` (several calls in one method), `call.response.id\|count\|status\|code\|correlation_id\|request_id`, `<dep>.outcome` (per dependency, on the root); auth step: `auth.provider`, `auth.grant`, `auth.token_source`, `auth.token_ttl_s`, `auth.result`, `auth.on_failure` |
-| Messaging (05) | `event_type`, `event_status`, `event_source`, `route` (handler chosen by event type), `consumer.action`, `consumer.delivery_attempt` (redeliveries of this record before this one, from the retry-topic / error-handler attempt header), `publish.result`, `publish.partition`, `publish.offset`, `correlation_id_generated` |
+| Handover (04) | keys named after the call (00 §6): `<dep>.<action>.` + `version`, `id`, `ids_count`, `flags`, `page_size`, `<flag name>`, `response.id\|count\|status\|code\|correlation_id\|request_id` (e.g. `pbas.company_account_search.page_size`); `<dep>.outcome` (per dependency, on the root); `call.purpose` only on a span that exists for one call (04 §4.4 retry span, a `@WithSpan` per call); auth step (common to every service): `auth.provider`, `auth.grant`, `auth.token_source`, `auth.token_ttl_s`, `auth.result`, `auth.on_failure` |
+| Messaging (05) | keys named after the message (00 §6): `<system>.kafka.<subject>.` or `<system>.rabbitmq.<subject>.` + `message.id`, `conversation_id`, `event_type`, `event_status`, `event_source`, `route` (handler chosen by event type), `consumer.action`, `delivery_attempt` (redeliveries of this record before this one), `skip_reason`, `publish.result`, `publish.partition`, `publish.offset` (e.g. `dih.kafka.userdetails.message.id`, `fabric.kafka.account.publish.result`); `correlation_id_generated` (common) |
 | Jobs (06) | `job.name`, `job.run_id`, `job.trigger` (`scheduled\|api\|message\|cronjob\|manual`), `job.status` (`running\|success\|failed\|partial\|skipped_lock`), `job.batch_status` (raw Spring Batch status), `job.exit_code`, `job.lock`, `job.params` (names only), `job.execution_id`, `job.instance_id`, `job.step`, `job.step.execution_id\|status\|read\|write\|skip\|rollback`, `job.items_total\|processed\|failed\|skipped`, `check.<system>` (per-system comparison result of a monitoring run) |
 | UI (07) | `screen`, `mfe`, `endpoint`, `error_type`, `step` (phase of a long flow), `proxy.target` (BFF) |
 
